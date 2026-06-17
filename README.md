@@ -58,11 +58,28 @@ make install                                   # builds the binary + blob-cache 
 
 regcachectl up                                  # create/start the fleet (idempotent, no creds)
 regcachectl status                              # state, disk use, reachability
+regcachectl list                                # cached objects + space per cache
+regcachectl list --objects                      # full inventory (repo:tag / sized blob digests)
 regcachectl print-registries > registries.yaml  # the k3s wiring snippet
 regcachectl gc                                   # reclaim space in the public caches
 regcachectl down                                 # stop & remove (keeps cached blobs)
 regcachectl down --purge                         # also drop the cached blobs
 ```
+
+`list` reports what each cache actually holds and how much space it uses:
+
+```
+docker.io    [registry:2 :5000]  running — 9 images, 168.3M  (shared blob store; size is the cache total)
+repo.f5.com  [blobcache :5003]   running — 4 blobs, 117.1MB
+
+blob-cache total: 117.1MB
+```
+
+The blob cache is digest-keyed, so `--objects` shows exact per-layer sizes. For
+the public `registry:2` caches it lists the **truly-cached** repo:tags (read
+from the on-disk manifest store — the registry tags API proxies upstream and
+would over-report), and a shared-store total (per-repo sizes aren't attributable
+because blobs are shared).
 
 > The F5 blob-cache image is built by `make blobcache-image` (run automatically
 > by `make install`). If it's missing, `up` brings the public caches up and skips

@@ -3,6 +3,7 @@ package blobcache
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -121,6 +122,47 @@ func TestPassthrough_RelaysAuth(t *testing.T) {
 	resp.Body.Close()
 	if string(body) != "manifest-json" {
 		t.Fatalf("passthrough body=%q", body)
+	}
+}
+
+// TestStatsEndpoint: after caching a blob, /_cache reports it with its size.
+func TestStatsEndpoint(t *testing.T) {
+	blob := []byte("some-cached-bytes")
+	dg := digestOf(blob)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(blob)
+	}))
+	defer up.Close()
+	p, _ := New(up.URL, t.TempDir())
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	// empty cache first
+	var st Stats
+	getJSON(t, srv.URL+"/_cache", &st)
+	if st.Count != 0 {
+		t.Fatalf("fresh cache Count=%d, want 0", st.Count)
+	}
+	// cache one blob, then re-check
+	get(t, srv.URL+"/v2/images/x/blobs/"+dg)
+	getJSON(t, srv.URL+"/_cache", &st)
+	if st.Count != 1 || st.TotalBytes != int64(len(blob)) {
+		t.Fatalf("after caching: Count=%d TotalBytes=%d (want 1, %d)", st.Count, st.TotalBytes, len(blob))
+	}
+	if len(st.Blobs) != 1 || st.Blobs[0].Digest != dg {
+		t.Fatalf("blob inventory wrong: %+v", st.Blobs)
+	}
+}
+
+func getJSON(t *testing.T, url string, v any) {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+		t.Fatal(err)
 	}
 }
 

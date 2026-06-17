@@ -96,6 +96,17 @@ func run(ctx context.Context, argv []string) error {
 		}
 		return printStatus(ctx, e)
 
+	case "list", "ls":
+		fs := flag.NewFlagSet("list", flag.ExitOnError)
+		f := addRuntimeFlags(fs)
+		objects := fs.Bool("objects", false, "list every cached object (repo:tag / blob digest), not just totals")
+		_ = fs.Parse(rest)
+		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase)
+		if err != nil {
+			return err
+		}
+		return printList(ctx, e, *objects)
+
 	case "gc":
 		fs := flag.NewFlagSet("gc", flag.ExitOnError)
 		f := addRuntimeFlags(fs)
@@ -182,6 +193,47 @@ func printStatus(ctx context.Context, e *cache.Engine) error {
 	return tw.Flush()
 }
 
+func printList(ctx context.Context, e *cache.Engine, objects bool) error {
+	listings, err := e.List(ctx)
+	if err != nil {
+		return err
+	}
+	var grand int64
+	for _, l := range listings {
+		count := len(l.Objects)
+		unit := "objects"
+		if l.Engine == "blobcache" {
+			unit = "blobs"
+		} else {
+			unit = "images"
+		}
+		note := ""
+		if l.Note != "" {
+			note = "  (" + l.Note + ")"
+		}
+		fmt.Printf("%s  [%s :%d]  %s — %d %s, %s%s\n",
+			l.Host, l.Engine, l.Port, l.State, count, unit, l.Size, note)
+		grand += l.Bytes
+		if objects {
+			tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+			for _, o := range l.Objects {
+				if o.Size != "" {
+					fmt.Fprintf(tw, "    %s\t%s\n", o.Name, o.Size)
+				} else {
+					fmt.Fprintf(tw, "    %s\t\n", o.Name)
+				}
+			}
+			tw.Flush()
+		}
+	}
+	// Grand total reflects only caches with attributable byte totals (the blob
+	// cache); registry:2 totals are human-only (shared store) and not summed.
+	if grand > 0 {
+		fmt.Printf("\nblob-cache total: %s\n", cache.HumanBytes(grand))
+	}
+	return nil
+}
+
 // probe checks the cache's /v2/ endpoint on the host. A pull-through cache
 // answers 200 or 401 (registry:2 proxies anonymous to upstream) — both
 // mean "reachable".
@@ -210,6 +262,7 @@ COMMANDS:
   up                 create/start the cache fleet (idempotent; holds no creds)
   down               stop & remove the fleet (--purge also drops cached blobs)
   status             show per-cache state, disk use, reachability
+  list (ls)          list cached objects + space (-objects for full inventory)
   gc                 run registry garbage-collect in each public cache
   print-registries   emit the k3s registries.yaml snippet to wire nodes
   serve-blobcache    (internal) run the credential-free blob cache; used by the

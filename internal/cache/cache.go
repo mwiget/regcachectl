@@ -269,7 +269,15 @@ func (e *Engine) Status(ctx context.Context) ([]Status, error) {
 		switch {
 		case exists && running:
 			s.State = "running"
-			if du, err := e.run(ctx, "exec", container(u), "du", "-sh", "/var/lib/registry"); err == nil {
+			if u.Blobcache {
+				// distroless container — size comes from the /_cache endpoint.
+				var st struct {
+					TotalBytes int64 `json:"total_bytes"`
+				}
+				if err := e.httpJSON(ctx, s.Port, "/_cache", &st); err == nil {
+					s.DiskUsage = HumanBytes(st.TotalBytes)
+				}
+			} else if du, err := e.run(ctx, "exec", container(u), "du", "-sh", "/var/lib/registry"); err == nil {
 				s.DiskUsage = strings.Fields(du)[0]
 			}
 		case exists:

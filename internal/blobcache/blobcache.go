@@ -25,6 +25,7 @@ package blobcache
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -34,6 +35,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -81,6 +83,10 @@ func New(upstream, cacheDir string) (*Proxy, error) {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/_cache" {
+		p.serveStats(w)
+		return
+	}
 	if m := blobRe.FindStringSubmatch(r.URL.Path); m != nil && r.Method == http.MethodGet {
 		p.serveBlob(w, r, m[1])
 		return
@@ -207,6 +213,48 @@ func copyHeader(dst, src http.Header) {
 			dst.Add(k, v)
 		}
 	}
+}
+
+// Stats is the cached-blob inventory served at /_cache, so `regcachectl list`
+// can report the cached objects and their exact (digest-keyed) sizes — the
+// container is distroless, so an in-container `du` is not available.
+type Stats struct {
+	Count      int        `json:"count"`
+	TotalBytes int64      `json:"total_bytes"`
+	Blobs      []BlobInfo `json:"blobs"`
+}
+
+// BlobInfo is one cached blob.
+type BlobInfo struct {
+	Digest string `json:"digest"`
+	Size   int64  `json:"size"`
+}
+
+func (p *Proxy) stats() Stats {
+	var st Stats
+	entries, err := os.ReadDir(filepath.Join(p.cacheDir, "blobs"))
+	if err != nil {
+		return st // missing dir → empty cache
+	}
+	for _, e := range entries {
+		if e.IsDir() || strings.HasPrefix(e.Name(), "dl-") {
+			continue // skip in-flight temp downloads
+		}
+		fi, err := e.Info()
+		if err != nil {
+			continue
+		}
+		st.Blobs = append(st.Blobs, BlobInfo{Digest: "sha256:" + e.Name(), Size: fi.Size()})
+		st.TotalBytes += fi.Size()
+		st.Count++
+	}
+	sort.Slice(st.Blobs, func(i, j int) bool { return st.Blobs[i].Size > st.Blobs[j].Size })
+	return st
+}
+
+func (p *Proxy) serveStats(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(p.stats())
 }
 
 // ListenAndServe runs the proxy until the process exits.
