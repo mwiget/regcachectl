@@ -1,5 +1,9 @@
 # regcachectl
 
+[![regcachectl](https://img.shields.io/badge/image%20cache-regcachectl-2496ed?logo=docker&logoColor=white)](https://github.com/mwiget/regcachectl)
+![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)
+![Last commit](https://img.shields.io/github/last-commit/mwiget/regcachectl)
+
 A local **fleet of `registry:2` pull-through caches** — one container per
 upstream registry — so repeatedly created/destroyed **k3s-in-docker** clusters
 (tmmlitectl, ocibnkctl, …) stop re-pulling the same images from the public and
