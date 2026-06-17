@@ -1,0 +1,136 @@
+package blobcache
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+)
+
+func digestOf(b []byte) string {
+	s := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(s[:])
+}
+
+// TestServeBlob_InlineAndHit: upstream serves a blob inline (200); first GET is
+// a MISS that caches, second GET is a HIT served from disk with the upstream
+// never touched again.
+func TestServeBlob_InlineAndHit(t *testing.T) {
+	blob := []byte("hello-layer-bytes")
+	dg := digestOf(blob)
+	var upstreamHits int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamHits, 1)
+		w.Write(blob)
+	}))
+	defer up.Close()
+
+	p, err := New(up.URL, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	url := srv.URL + "/v2/images/x/blobs/" + dg
+	if got, xc := get(t, url); got != string(blob) || xc != "MISS" {
+		t.Fatalf("first GET: body=%q x-cache=%q", got, xc)
+	}
+	if got, xc := get(t, url); got != string(blob) || xc != "HIT" {
+		t.Fatalf("second GET: body=%q x-cache=%q (want HIT)", got, xc)
+	}
+	if n := atomic.LoadInt32(&upstreamHits); n != 1 {
+		t.Errorf("upstream hit %d times, want 1 (second should be a cache HIT)", n)
+	}
+}
+
+// TestServeBlob_FollowsRedirect: upstream 302s the blob to a signed URL that
+// requires NO auth — the proxy must follow it and cache the result.
+func TestServeBlob_FollowsRedirect(t *testing.T) {
+	blob := strings.Repeat("L", 4096)
+	dg := digestOf([]byte(blob))
+
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			t.Errorf("signed-URL fetch must carry NO Authorization, got %q", r.Header.Get("Authorization"))
+		}
+		io.WriteString(w, blob)
+	}))
+	defer storage.Close()
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer tok" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		http.Redirect(w, r, storage.URL+"/signed", http.StatusFound)
+	}))
+	defer up.Close()
+
+	p, err := New(up.URL, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	// client supplies its OWN bearer; proxy relays it to upstream, follows 302.
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/v2/images/x/blobs/"+dg, nil)
+	req.Header.Set("Authorization", "Bearer tok")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != blob {
+		t.Fatalf("redirected blob body mismatch (len %d)", len(body))
+	}
+	if resp.Header.Get("Docker-Content-Digest") != dg {
+		t.Errorf("missing/incorrect Docker-Content-Digest")
+	}
+}
+
+// TestPassthrough_RelaysAuth: non-blob paths (manifests) are proxied with the
+// client's Authorization forwarded and are not cached.
+func TestPassthrough_RelaysAuth(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer abc" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		io.WriteString(w, "manifest-json")
+	}))
+	defer up.Close()
+
+	p, _ := New(up.URL, t.TempDir())
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/v2/images/x/manifests/latest", nil)
+	req.Header.Set("Authorization", "Bearer abc")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "manifest-json" {
+		t.Fatalf("passthrough body=%q", body)
+	}
+}
+
+func get(t *testing.T, url string) (body, xcache string) {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return string(b), resp.Header.Get("X-Cache")
+}

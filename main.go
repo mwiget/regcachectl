@@ -26,6 +26,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/mwiget/regcachectl/internal/blobcache"
 	"github.com/mwiget/regcachectl/internal/cache"
 )
 
@@ -65,14 +66,13 @@ func run(ctx context.Context, argv []string) error {
 	case "up":
 		fs := flag.NewFlagSet("up", flag.ExitOnError)
 		f := addRuntimeFlags(fs)
-		farKey := fs.String("far-key", "", "FAR tgz for repo.f5.com creds (e.g. keys/f5-far-auth-key.tgz)")
 		_ = fs.Parse(rest)
 		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase)
 		if err != nil {
 			return err
 		}
-		fmt.Println("Bringing up pull-through cache fleet (" + e.Runtime + ", " + e.ImageName() + "):")
-		return e.Up(ctx, *farKey)
+		fmt.Println("Bringing up pull-through cache fleet (" + e.Runtime + ", holds no credentials):")
+		return e.Up(ctx)
 
 	case "down":
 		fs := flag.NewFlagSet("down", flag.ExitOnError)
@@ -117,12 +117,26 @@ func run(ctx context.Context, argv []string) error {
 		fmt.Print(e.RenderRegistries(*host, !*noFallback))
 		return nil
 
+	case "serve-blobcache":
+		fs := flag.NewFlagSet("serve-blobcache", flag.ExitOnError)
+		upstream := fs.String("upstream", "", "upstream registry base URL (e.g. https://repo.f5.com)")
+		listen := fs.String("listen", ":5000", "listen address")
+		cacheDir := fs.String("cache-dir", "/var/lib/blobcache", "blob cache directory")
+		_ = fs.Parse(rest)
+		if *upstream == "" {
+			return fmt.Errorf("serve-blobcache: --upstream is required")
+		}
+		bp, err := blobcache.New(*upstream, *cacheDir)
+		if err != nil {
+			return err
+		}
+		return bp.ListenAndServe(*listen)
+
 	case "install-systemd":
 		fs := flag.NewFlagSet("install-systemd", flag.ExitOnError)
-		farKey := fs.String("far-key", "", "FAR tgz path baked into the unit's ExecStart")
 		write := fs.Bool("write", false, "write the unit to /etc/systemd/system (needs root)")
 		_ = fs.Parse(rest)
-		return installSystemd(*farKey, *write)
+		return installSystemd(*write)
 
 	case "version", "-v", "--version":
 		fmt.Println("regcachectl", version)
@@ -193,21 +207,28 @@ USAGE:
   regcachectl <command> [flags]
 
 COMMANDS:
-  up                 create/start the cache fleet (idempotent)
+  up                 create/start the cache fleet (idempotent; holds no creds)
   down               stop & remove the fleet (--purge also drops cached blobs)
   status             show per-cache state, disk use, reachability
-  gc                 run registry garbage-collect in each cache
+  gc                 run registry garbage-collect in each public cache
   print-registries   emit the k3s registries.yaml snippet to wire nodes
+  serve-blobcache    (internal) run the credential-free blob cache; used by the
+                     repo.f5.com container, not run by hand
   install-systemd    print/write a systemd unit so the fleet survives reboot
   version            print version
 
 COMMON FLAGS:
   --runtime docker|podman   (autodetect if empty)
   --port-base 5000          host port of the first cache
-  --far-key PATH            FAR tgz for repo.f5.com upstream creds (up only)
+
+The fleet stores NO registry credentials. Public registries are cached
+anonymously; repo.f5.com is a credential-free blob cache — each client (k3s
+cluster) supplies its own FAR key via its registries.yaml, so different BNK
+versions can use different keys against the same cache.
 
 EXAMPLE:
-  regcachectl up --far-key keys/f5-far-auth-key.tgz
+  make blobcache-image          # once, builds the repo.f5.com blob-cache image
+  regcachectl up
   regcachectl print-registries > registries.yaml
   regcachectl status
 `)

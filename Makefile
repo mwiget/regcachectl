@@ -1,16 +1,24 @@
-BIN      := bin/regcachectl
-PKG      := github.com/mwiget/regcachectl
-GOFLAGS  := -trimpath
-LDFLAGS  := -s -w
+BIN        := bin/regcachectl
+PKG        := github.com/mwiget/regcachectl
+GOFLAGS    := -trimpath
+LDFLAGS    := -s -w
+BLOBCACHE_IMAGE := regcache-blobcache:latest
 
-.PHONY: build install test smoke fmt vet tidy clean
+.PHONY: build install test smoke fmt vet tidy clean blobcache-image
 
 build:
 	go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BIN) .
 
-install: build
+install: build blobcache-image
 	install -D -m 0755 $(BIN) $(HOME)/.local/bin/regcachectl
 	@echo "installed -> $(HOME)/.local/bin/regcachectl"
+
+# blobcache-image builds the credential-free repo.f5.com blob-cache image from a
+# static linux binary (CGO off → runs on distroless/static).
+blobcache-image:
+	CGO_ENABLED=0 GOOS=linux go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o bin/regcachectl-linux .
+	docker build -t $(BLOBCACHE_IMAGE) .
+	@echo "built $(BLOBCACHE_IMAGE)"
 
 test:
 	go test ./...

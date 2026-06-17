@@ -19,14 +19,18 @@ import (
 	"io"
 	"os/exec"
 	"strings"
-
-	"github.com/mwiget/regcachectl/internal/far"
 )
 
-// RegistryImage is the pull-through cache image. registry:2 is the CNCF
-// distribution registry; in proxy mode (REGISTRY_PROXY_REMOTEURL) it is a
-// transparent caching mirror. Override with --image / RegcacheImage.
+// RegistryImage is the pull-through cache image for the public, anonymous
+// upstreams. registry:2 is the CNCF distribution registry; in proxy mode
+// (REGISTRY_PROXY_REMOTEURL) it is a transparent caching mirror.
 const RegistryImage = "registry:2.8.3"
+
+// BlobcacheImage runs regcachectl's own credential-free, redirect-following
+// blob cache (cmd `serve-blobcache`) for the private GAR-backed upstream. The
+// client supplies its own credential via the cluster's registries.yaml, so the
+// cache stores no secret. Build it with `make blobcache-image`.
+const BlobcacheImage = "regcache-blobcache:latest"
 
 const (
 	containerPrefix = "regcache-"
@@ -42,19 +46,25 @@ const (
 
 // Upstream is one registry the fleet caches.
 type Upstream struct {
-	Name    string // short id and container/volume suffix
-	Host    string // the registry hostname clients pull from
-	Remote  string // the v2 API base registry:2 proxies to
-	AuthFAR bool   // pull upstream creds from the FAR tgz
+	Name   string // short id and container/volume suffix
+	Host   string // the registry hostname clients pull from
+	Remote string // the upstream v2 API base
+	// Blobcache runs the credential-free, redirect-following blob cache
+	// (serve-blobcache) instead of an anonymous registry:2 proxy. Used for the
+	// private GAR-backed upstream where the CLIENT supplies the credential and
+	// the upstream serves layers via signed-URL redirects.
+	Blobcache bool
 }
 
 // Upstreams is the fixed set of registries every supported ctl tool pulls
-// from (see tmmlitectl AGENTS.md image inventory).
+// from (see tmmlitectl AGENTS.md image inventory). The public three are
+// anonymous registry:2 pull-through caches; repo.f5.com is the credential-free
+// blob cache.
 var Upstreams = []Upstream{
 	{Name: "dockerhub", Host: "docker.io", Remote: "https://registry-1.docker.io"},
 	{Name: "ghcr", Host: "ghcr.io", Remote: "https://ghcr.io"},
 	{Name: "quay", Host: "quay.io", Remote: "https://quay.io"},
-	{Name: "f5", Host: "repo.f5.com", Remote: "https://repo.f5.com", AuthFAR: true},
+	{Name: "f5", Host: "repo.f5.com", Remote: "https://repo.f5.com", Blobcache: true},
 }
 
 // Engine drives the fleet against a chosen runtime.
@@ -132,24 +142,20 @@ func (e *Engine) logf(format string, a ...any) {
 	}
 }
 
-// Up brings up (or reconciles) the whole fleet. farKey may be empty, in
-// which case the F5 cache is skipped with a warning and the public caches
-// still come up. Idempotent: existing containers are left running.
-func (e *Engine) Up(ctx context.Context, farKey string) error {
-	var creds far.Creds
-	haveCreds := false
-	if farKey != "" {
-		c, err := far.Extract(farKey)
-		if err != nil {
-			return fmt.Errorf("FAR key: %w", err)
-		}
-		creds, haveCreds = c, true
-	}
-
+// Up brings up (or reconciles) the whole fleet. No credentials are needed or
+// stored: the public upstreams are anonymous registry:2 caches and the private
+// upstream is the credential-free blob cache (clients supply their own key via
+// the cluster's registries.yaml). Idempotent: existing containers are left
+// running. The blob cache requires its image (see `make blobcache-image`).
+func (e *Engine) Up(ctx context.Context) error {
 	for i, u := range Upstreams {
-		if u.AuthFAR && !haveCreds {
-			e.logf("  ! %-9s skipped — needs --far-key for %s (public caches still up)", u.Name, u.Host)
-			continue
+		if u.Blobcache {
+			if ok, err := e.imageExists(ctx, BlobcacheImage); err != nil {
+				return err
+			} else if !ok {
+				e.logf("  ! %-9s skipped — blob-cache image %s not found (run `make blobcache-image`); public caches still up", u.Name, BlobcacheImage)
+				continue
+			}
 		}
 		if err := e.ensureVolume(ctx, volume(u)); err != nil {
 			return err
@@ -170,30 +176,53 @@ func (e *Engine) Up(ctx context.Context, farKey string) error {
 			}
 			continue
 		}
-		args := []string{
-			"run", "-d",
-			"--name", container(u),
-			"--label", label,
-			"--label", "tmm-regcache.host=" + u.Host,
-			"--restart=always",
-			"-p", fmt.Sprintf("%d:5000", port),
-			"-v", volume(u) + ":/var/lib/registry",
-			"-e", "REGISTRY_PROXY_REMOTEURL=" + u.Remote,
-			"-e", "REGISTRY_STORAGE_DELETE_ENABLED=true",
-		}
-		if u.AuthFAR {
-			args = append(args,
-				"-e", "REGISTRY_PROXY_USERNAME="+creds.Username,
-				"-e", "REGISTRY_PROXY_PASSWORD="+creds.Password,
-			)
-		}
-		args = append(args, e.ImageName())
-		if _, err := e.run(ctx, args...); err != nil {
+		if _, err := e.run(ctx, e.runArgs(u, port)...); err != nil {
 			return fmt.Errorf("start %s: %w", u.Name, err)
 		}
-		e.logf("  + %-9s created   %s → :%d  (proxy %s)", u.Name, u.Host, port, u.Remote)
+		kind := "proxy"
+		if u.Blobcache {
+			kind = "blobcache, no creds"
+		}
+		e.logf("  + %-9s created   %s → :%d  (%s %s)", u.Name, u.Host, port, kind, u.Remote)
 	}
 	return nil
+}
+
+// runArgs builds the `<runtime> run` argv for one upstream cache.
+func (e *Engine) runArgs(u Upstream, port int) []string {
+	base := []string{
+		"run", "-d",
+		"--name", container(u),
+		"--label", label,
+		"--label", "tmm-regcache.host=" + u.Host,
+		"--restart=always",
+		"-p", fmt.Sprintf("%d:5000", port),
+	}
+	if u.Blobcache {
+		// credential-free blob cache: client supplies auth via registries.yaml.
+		return append(base,
+			"-v", volume(u)+":/var/lib/blobcache",
+			BlobcacheImage,
+			"serve-blobcache", "--upstream", u.Remote,
+			"--listen", ":5000", "--cache-dir", "/var/lib/blobcache",
+		)
+	}
+	// anonymous registry:2 pull-through cache.
+	return append(base,
+		"-v", volume(u)+":/var/lib/registry",
+		"-e", "REGISTRY_PROXY_REMOTEURL="+u.Remote,
+		"-e", "REGISTRY_STORAGE_DELETE_ENABLED=true",
+		e.ImageName(),
+	)
+}
+
+// imageExists reports whether the runtime has the named image locally.
+func (e *Engine) imageExists(ctx context.Context, ref string) (bool, error) {
+	out, err := e.run(ctx, "images", "-q", ref)
+	if err != nil {
+		return false, err
+	}
+	return out != "", nil
 }
 
 // Down stops and removes the fleet. purge also deletes the cached blobs.
@@ -259,6 +288,12 @@ func (e *Engine) GC(ctx context.Context) error {
 			return err
 		}
 		if !running {
+			continue
+		}
+		if u.Blobcache {
+			// The blob cache is digest-keyed and immutable; nothing to mark/
+			// sweep. (Reclaim space by purging its volume on `down --purge`.)
+			e.logf("  · %-9s blobcache (digest-keyed; no gc)", u.Name)
 			continue
 		}
 		out, err := e.run(ctx, "exec", container(u),

@@ -13,17 +13,12 @@ const unitPath = "/etc/systemd/system/tmm-regcache.service"
 // restarts them after a reboot on its own; this unit is the belt-and-
 // suspenders option that also re-creates anything missing and pins the
 // far-key into ExecStart.
-func installSystemd(farKey string, write bool) error {
+func installSystemd(write bool) error {
 	self, err := os.Executable()
 	if err != nil || self == "" {
 		self = "/usr/local/bin/regcachectl"
 	} else {
 		self, _ = filepath.Abs(self)
-	}
-	farArg := ""
-	if farKey != "" {
-		abs, _ := filepath.Abs(farKey)
-		farArg = " --far-key " + abs
 	}
 	unit := fmt.Sprintf(`[Unit]
 Description=tmm registry pull-through cache fleet (regcachectl)
@@ -34,17 +29,17 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=%s up%s
+ExecStart=%s up
 ExecStop=%s down
 TimeoutStartSec=300
 
 [Install]
 WantedBy=multi-user.target
-`, self, farArg, self)
+`, self, self)
 
 	if !write {
 		fmt.Print(unit)
-		fmt.Fprintf(os.Stderr, "\n# to install:\n#   sudo regcachectl install-systemd%s --write\n#   sudo systemctl enable --now tmm-regcache.service\n", farArg)
+		fmt.Fprintf(os.Stderr, "\n# to install:\n#   sudo regcachectl install-systemd --write\n#   sudo systemctl enable --now tmm-regcache.service\n")
 		return nil
 	}
 	if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
