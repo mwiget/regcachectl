@@ -99,13 +99,14 @@ func run(ctx context.Context, argv []string) error {
 	case "list", "ls":
 		fs := flag.NewFlagSet("list", flag.ExitOnError)
 		f := addRuntimeFlags(fs)
-		objects := fs.Bool("objects", false, "list every cached object (repo:tag / blob digest), not just totals")
+		objects := fs.Bool("objects", false, "list cached images (repo:tag, or repo name for F5 blobs), not just totals")
+		blobs := fs.Bool("blobs", false, "for the F5 blob cache, list individual layer digests + sizes instead of image names")
 		_ = fs.Parse(rest)
 		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase)
 		if err != nil {
 			return err
 		}
-		return printList(ctx, e, *objects)
+		return printList(ctx, e, *objects || *blobs, *blobs)
 
 	case "gc":
 		fs := flag.NewFlagSet("gc", flag.ExitOnError)
@@ -193,38 +194,39 @@ func printStatus(ctx context.Context, e *cache.Engine) error {
 	return tw.Flush()
 }
 
-func printList(ctx context.Context, e *cache.Engine, objects bool) error {
+func printList(ctx context.Context, e *cache.Engine, objects, blobs bool) error {
 	listings, err := e.List(ctx)
 	if err != nil {
 		return err
 	}
 	var grand int64
 	for _, l := range listings {
-		count := len(l.Objects)
-		unit := "objects"
+		// Default object view is image-level for every cache (repo:tag, or repo
+		// name for F5 blobs). --blobs switches the F5 cache to its layer detail.
+		items := l.Objects
+		count := fmt.Sprintf("%d images", len(items))
 		if l.Engine == "blobcache" {
-			unit = "blobs"
-		} else {
-			unit = "images"
+			// the F5 cache stores layers, not images — show both counts.
+			count = fmt.Sprintf("%d images (%d blobs)", len(l.Objects), len(l.Blobs))
+			if blobs {
+				items = l.Blobs
+				count = fmt.Sprintf("%d blobs", len(l.Blobs))
+			}
 		}
 		note := ""
 		if l.Note != "" {
 			note = "  (" + l.Note + ")"
 		}
-		fmt.Printf("%s  [%s :%d]  %s — %d %s, %s%s\n",
-			l.Host, l.Engine, l.Port, l.State, count, unit, l.Size, note)
+		fmt.Printf("%s  [%s :%d]  %s — %s, %s%s\n",
+			l.Host, l.Engine, l.Port, l.State, count, l.Size, note)
 		grand += l.Bytes
 		if objects {
 			tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-			for _, o := range l.Objects {
-				detail := o.Detail
-				if detail == "" && l.Engine == "blobcache" {
-					detail = "(unnamed — re-pull to record)"
-				}
-				if o.Size != "" {
-					fmt.Fprintf(tw, "    %s\t%s\t%s\n", o.Name, o.Size, detail)
+			for _, o := range items {
+				if o.Size != "" || o.Detail != "" {
+					fmt.Fprintf(tw, "    %s\t%s\t%s\n", o.Name, o.Size, o.Detail)
 				} else {
-					fmt.Fprintf(tw, "    %s\t\t%s\n", o.Name, detail)
+					fmt.Fprintf(tw, "    %s\n", o.Name)
 				}
 			}
 			tw.Flush()

@@ -63,7 +63,8 @@ make install                                   # builds the binary + blob-cache 
 regcachectl up                                  # create/start the fleet (idempotent, no creds)
 regcachectl status                              # state, disk use, reachability
 regcachectl list                                # cached objects + space per cache
-regcachectl list --objects                      # full inventory (repo:tag / sized blob digests + repo names)
+regcachectl list --objects                      # image-level inventory (repo:tag) for every cache
+regcachectl list --blobs                        # F5 cache: per-layer digests + sizes + the images they belong to
 regcachectl print-registries > registries.yaml  # the k3s wiring snippet
 regcachectl gc                                   # reclaim space in the public caches
 regcachectl down                                 # stop & remove (keeps cached blobs)
@@ -79,23 +80,43 @@ repo.f5.com  [blobcache :5003]   running — 4 blobs, 117.1MB
 blob-cache total: 117.1MB
 ```
 
-The blob cache is digest-keyed, so `--objects` shows exact per-layer sizes —
-annotated with the **repo name(s)** each blob was served under:
+The F5 blob cache is digest-keyed (it stores *layers*, not images), but
+`--objects` presents it at the **image level** like the `registry:2` caches —
+one `repo:tag` line per image:
 
 ```
-repo.f5.com  [blobcache :5003]  running — 254 blobs, 1.0GB
-    sha256:39e4ff14…0f35f66  91.7MB  images/tmm-img
-    sha256:cf6727ff…f367385  69.8MB  images/tmm-img, images/dssm-store
+repo.f5.com  [blobcache :5003]  running — 15 images (127 blobs), 560.3MB  (shared layers, size is the cache total)
+    images/tmm-img:v2.3.0
+    images/f5-dssm-store:v2.3.0
+    images/rabbit:v2.3.0
+    …
 ```
+
+`--blobs` drops to the layer detail — each digest, its exact size, and the
+image(s) it belongs to (a shared base layer lists them all):
+
+```
+repo.f5.com  [blobcache :5003]  running — 127 blobs, 560.3MB  (shared layers, size is the cache total)
+    sha256:b2a7a667…aecb79f  58.8MB  images/f5-dssm-store, images/ocnos-img-init, images/rabbit
+    sha256:e6f7c758…1a1709    58.4MB  images/tmm-img
+```
+
+### How the names + tags are recovered
 
 The blob cache never caches manifests (that's what keeps it credential-free), so
-it has no built-in blob→image map. Instead it records the repo from each blob
-request path (`/v2/<repo>/blobs/<digest>`, never a credential) into a sidecar
-index. The name is captured on **every** request — including a cache HIT — so a
-blob is named the next time any pull touches it, even a fully warm redeploy that
-fetches nothing upstream. A blob cached before this was added (or never
-re-requested) lists as `(unnamed — re-pull to record)`; one pull names it. A
-blob shared by several images lists all of them.
+it has no built-in blob→image map. It reconstructs one from the request paths,
+neither of which is a credential:
+
+- **repo** comes from each blob path (`/v2/<repo>/blobs/<digest>`), recorded per
+  digest;
+- **tag** comes from each manifest path (`/v2/<repo>/manifests/<tag>`) — relayed,
+  never cached, only noted. A digest reference carries no human tag and is
+  skipped, so a digest-pinned image lists as a bare `repo` with no `:tag`.
+
+Both are captured on **every** request — including a cache HIT — so the names and
+tags fill in the next time any pull touches the image, even a fully warm redeploy
+that fetches nothing upstream. A layer cached before this (or not yet
+re-requested) lists as `(N unnamed layer(s) — re-pull to record)`.
 
 For the public `registry:2` caches `--objects` lists the **truly-cached**
 repo:tags (read from the on-disk manifest store — the registry tags API proxies

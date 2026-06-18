@@ -194,6 +194,32 @@ func TestRecordsRepoNames(t *testing.T) {
 	}
 }
 
+// TestRecordsTags: a manifest GET by tag is relayed (not cached) but the
+// repo→tag is recorded; a manifest by digest records no tag.
+func TestRecordsTags(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, "manifest-bytes")
+	}))
+	defer up.Close()
+	p, _ := New(up.URL, t.TempDir())
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	// pull-by-tag records the tag; pull-by-digest records nothing.
+	get(t, srv.URL+"/v2/images/tmm-img/manifests/v2.3.0")
+	get(t, srv.URL+"/v2/images/tmm-img/manifests/sha256:"+strings.Repeat("a", 64))
+	// a layer GET so the image shows up in stats with a repo.
+	blob := []byte("layer")
+	get(t, srv.URL+"/v2/images/tmm-img/blobs/"+digestOf(blob))
+
+	var st Stats
+	getJSON(t, srv.URL+"/_cache", &st)
+	got := st.Tags["images/tmm-img"]
+	if len(got) != 1 || got[0] != "v2.3.0" {
+		t.Fatalf("tags = %v, want [v2.3.0] (digest ref must not be recorded)", got)
+	}
+}
+
 func getJSON(t *testing.T, url string, v any) {
 	t.Helper()
 	resp, err := http.Get(url)
