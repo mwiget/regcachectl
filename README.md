@@ -63,7 +63,7 @@ make install                                   # builds the binary + blob-cache 
 regcachectl up                                  # create/start the fleet (idempotent, no creds)
 regcachectl status                              # state, disk use, reachability
 regcachectl list                                # cached objects + space per cache
-regcachectl list --objects                      # full inventory (repo:tag / sized blob digests)
+regcachectl list --objects                      # full inventory (repo:tag / sized blob digests + repo names)
 regcachectl print-registries > registries.yaml  # the k3s wiring snippet
 regcachectl gc                                   # reclaim space in the public caches
 regcachectl down                                 # stop & remove (keeps cached blobs)
@@ -79,11 +79,28 @@ repo.f5.com  [blobcache :5003]   running — 4 blobs, 117.1MB
 blob-cache total: 117.1MB
 ```
 
-The blob cache is digest-keyed, so `--objects` shows exact per-layer sizes. For
-the public `registry:2` caches it lists the **truly-cached** repo:tags (read
-from the on-disk manifest store — the registry tags API proxies upstream and
-would over-report), and a shared-store total (per-repo sizes aren't attributable
-because blobs are shared).
+The blob cache is digest-keyed, so `--objects` shows exact per-layer sizes —
+annotated with the **repo name(s)** each blob was served under:
+
+```
+repo.f5.com  [blobcache :5003]  running — 254 blobs, 1.0GB
+    sha256:39e4ff14…0f35f66  91.7MB  images/tmm-img
+    sha256:cf6727ff…f367385  69.8MB  images/tmm-img, images/dssm-store
+```
+
+The blob cache never caches manifests (that's what keeps it credential-free), so
+it has no built-in blob→image map. Instead it records the repo from each blob
+request path (`/v2/<repo>/blobs/<digest>`, never a credential) into a sidecar
+index. The name is captured on **every** request — including a cache HIT — so a
+blob is named the next time any pull touches it, even a fully warm redeploy that
+fetches nothing upstream. A blob cached before this was added (or never
+re-requested) lists as `(unnamed — re-pull to record)`; one pull names it. A
+blob shared by several images lists all of them.
+
+For the public `registry:2` caches `--objects` lists the **truly-cached**
+repo:tags (read from the on-disk manifest store — the registry tags API proxies
+upstream and would over-report), and a shared-store total (per-repo sizes aren't
+attributable because blobs are shared).
 
 > The F5 blob-cache image is built by `make blobcache-image` (run automatically
 > by `make install`). If it's missing, `up` brings the public caches up and skips

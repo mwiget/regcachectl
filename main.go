@@ -217,10 +217,14 @@ func printList(ctx context.Context, e *cache.Engine, objects bool) error {
 		if objects {
 			tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 			for _, o := range l.Objects {
+				detail := o.Detail
+				if detail == "" && l.Engine == "blobcache" {
+					detail = "(unnamed — re-pull to record)"
+				}
 				if o.Size != "" {
-					fmt.Fprintf(tw, "    %s\t%s\n", o.Name, o.Size)
+					fmt.Fprintf(tw, "    %s\t%s\t%s\n", o.Name, o.Size, detail)
 				} else {
-					fmt.Fprintf(tw, "    %s\t\n", o.Name)
+					fmt.Fprintf(tw, "    %s\t\t%s\n", o.Name, detail)
 				}
 			}
 			tw.Flush()

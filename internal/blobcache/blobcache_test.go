@@ -154,6 +154,46 @@ func TestStatsEndpoint(t *testing.T) {
 	}
 }
 
+// TestRecordsRepoNames: the repo from the blob path is recorded per digest and
+// surfaced via /_cache — including a HIT under a *second* repo (shared blob),
+// which must add that repo without re-fetching upstream.
+func TestRecordsRepoNames(t *testing.T) {
+	blob := []byte("shared-layer")
+	dg := digestOf(blob)
+	var upstreamHits int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamHits, 1)
+		w.Write(blob)
+	}))
+	defer up.Close()
+	p, _ := New(up.URL, t.TempDir())
+	srv := httptest.NewServer(p)
+	defer srv.Close()
+
+	// MISS under repo A (caches + records A), then HIT under repo B (records B).
+	get(t, srv.URL+"/v2/images/tmm-img/blobs/"+dg)
+	get(t, srv.URL+"/v2/images/dssm-store/blobs/"+dg)
+
+	if n := atomic.LoadInt32(&upstreamHits); n != 1 {
+		t.Fatalf("upstream hit %d times, want 1 (second is a HIT)", n)
+	}
+	var st Stats
+	getJSON(t, srv.URL+"/_cache", &st)
+	if len(st.Blobs) != 1 {
+		t.Fatalf("want 1 blob, got %d", len(st.Blobs))
+	}
+	got := strings.Join(st.Blobs[0].Repos, ",")
+	if got != "images/dssm-store,images/tmm-img" { // readRepos sorts
+		t.Fatalf("repos = %q, want both repos (sorted)", got)
+	}
+	// idempotent: re-requesting an already-recorded repo adds no duplicate.
+	get(t, srv.URL+"/v2/images/tmm-img/blobs/"+dg)
+	getJSON(t, srv.URL+"/_cache", &st)
+	if len(st.Blobs[0].Repos) != 2 {
+		t.Fatalf("repos not deduped: %v", st.Blobs[0].Repos)
+	}
+}
+
 func getJSON(t *testing.T, url string, v any) {
 	t.Helper()
 	resp, err := http.Get(url)
