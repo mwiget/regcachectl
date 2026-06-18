@@ -109,9 +109,12 @@ neither of which is a credential:
 
 - **repo** comes from each blob path (`/v2/<repo>/blobs/<digest>`), recorded per
   digest;
-- **tag** comes from each manifest path (`/v2/<repo>/manifests/<tag>`) — relayed,
-  never cached, only noted. A digest reference carries no human tag and is
-  skipped, so a digest-pinned image lists as a bare `repo` with no `:tag`.
+- **tag** comes from each manifest path (`/v2/<repo>/manifests/<ref>`) — relayed,
+  never cached, only noted. A digest-pinned image is requested by digest (no tag
+  is ever sent), so it lists as `repo@sha256:short` instead of `repo:tag` — it
+  reads as "pinned by digest", not "missing a tag". The `registry:2` caches do
+  the same: a digest-pulled image (e.g. Cilium, whose helm chart pins by digest)
+  shows `repo@sha256:short` read from its on-disk manifest revisions.
 
 Both are captured on **every** request — including a cache HIT — so the names and
 tags fill in the next time any pull touches the image, even a fully warm redeploy
