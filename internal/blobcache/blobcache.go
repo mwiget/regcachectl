@@ -46,6 +46,12 @@ import (
 // credential, so capturing it preserves the credential-free posture.
 var blobRe = regexp.MustCompile(`^/v2/(.+)/blobs/(sha256:[0-9a-f]{64})$`)
 
+// manifestRe matches a registry v2 manifest path and captures the repo and the
+// reference (a tag or a digest). The reference is relayed, never cached; we only
+// note repo→tag from it so the listing can show repo:tag (the tag never appears
+// on a blob request). A tag is not a credential.
+var manifestRe = regexp.MustCompile(`^/v2/(.+)/manifests/(.+)$`)
+
 // Proxy is the caching reverse proxy for one upstream.
 type Proxy struct {
 	upstream *url.URL
@@ -91,6 +97,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/_cache" {
 		p.serveStats(w)
 		return
+	}
+	if m := manifestRe.FindStringSubmatch(r.URL.Path); m != nil &&
+		(r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		p.recordTag(m[1], m[2]) // note repo:tag, then fall through to relay
 	}
 	if m := blobRe.FindStringSubmatch(r.URL.Path); m != nil && r.Method == http.MethodGet {
 		p.serveBlob(w, r, m[1], m[2])
@@ -153,6 +163,36 @@ func readRepos(path string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func (p *Proxy) tagsPath(repo string) string {
+	return filepath.Join(p.cacheDir, "tags", url.QueryEscape(repo))
+}
+
+// recordTag notes that repo was requested at tag ref. A digest reference carries
+// no human tag, so it is ignored. Like recordRepo this fires on every manifest
+// request (relayed, never cached), so a warm re-pull still records the tag.
+func (p *Proxy) recordTag(repo, ref string) {
+	if repo == "" || ref == "" || strings.HasPrefix(ref, "sha256:") {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	tp := p.tagsPath(repo)
+	for _, e := range readRepos(tp) { // same newline-deduped sidecar format
+		if e == ref {
+			return
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(tp), 0o755); err != nil {
+		return
+	}
+	f, err := os.OpenFile(tp, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	f.WriteString(ref + "\n")
 }
 
 func (p *Proxy) serveBlob(w http.ResponseWriter, r *http.Request, repo, digest string) {
@@ -275,9 +315,10 @@ func copyHeader(dst, src http.Header) {
 // can report the cached objects and their exact (digest-keyed) sizes — the
 // container is distroless, so an in-container `du` is not available.
 type Stats struct {
-	Count      int        `json:"count"`
-	TotalBytes int64      `json:"total_bytes"`
-	Blobs      []BlobInfo `json:"blobs"`
+	Count      int                 `json:"count"`
+	TotalBytes int64               `json:"total_bytes"`
+	Blobs      []BlobInfo          `json:"blobs"`
+	Tags       map[string][]string `json:"tags,omitempty"` // repo → tag(s) seen on manifest requests
 }
 
 // BlobInfo is one cached blob, with the repo name(s) it was served under (if
@@ -311,6 +352,21 @@ func (p *Proxy) stats() Stats {
 		st.Count++
 	}
 	sort.Slice(st.Blobs, func(i, j int) bool { return st.Blobs[i].Size > st.Blobs[j].Size })
+
+	// repo → tag(s), decoded from the tags/ sidecar filenames.
+	if tagEntries, err := os.ReadDir(filepath.Join(p.cacheDir, "tags")); err == nil {
+		st.Tags = map[string][]string{}
+		for _, e := range tagEntries {
+			if e.IsDir() {
+				continue
+			}
+			repo, err := url.QueryUnescape(e.Name())
+			if err != nil {
+				continue
+			}
+			st.Tags[repo] = readRepos(p.tagsPath(repo))
+		}
+	}
 	return st
 }
 

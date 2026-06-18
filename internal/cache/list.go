@@ -19,8 +19,9 @@ type Listing struct {
 	State   string // running / stopped / absent
 	Size    string // human-readable total ("-" if unknown)
 	Bytes   int64  // total bytes (0 if unknown)
-	Objects []Object
-	Note    string // shared-store caveat etc.
+	Objects []Object // image-level view (repo:tag, or repo name for F5 blobs)
+	Blobs   []Object // F5 blob cache only: digest-level layer detail
+	Note    string   // shared-store caveat etc.
 }
 
 // Object is one cached item: a repo:tag (registry:2) or a blob digest
@@ -106,19 +107,54 @@ func (e *Engine) fillBlobcache(ctx context.Context, l *Listing) {
 			Size   int64    `json:"size"`
 			Repos  []string `json:"repos"`
 		} `json:"blobs"`
+		Tags map[string][]string `json:"tags"`
 	}
 	if err := e.httpJSON(ctx, l.Port, "/_cache", &st); err != nil {
 		return
 	}
 	l.Bytes = st.TotalBytes
 	l.Size = HumanBytes(st.TotalBytes)
+
+	// Digest-level detail (--blobs) and, by aggregating repo names, the
+	// image-level view (--objects, matching the registry:2 caches). A layer can
+	// be shared across images, so per-image sizes aren't attributable — only the
+	// cache total is, same caveat as the shared registry:2 store.
+	repoSet := map[string]bool{}
+	unnamed := 0
 	for _, b := range st.Blobs {
-		l.Objects = append(l.Objects, Object{
+		l.Blobs = append(l.Blobs, Object{
 			Name:   b.Digest,
 			Size:   HumanBytes(b.Size),
 			Detail: strings.Join(b.Repos, ", "),
 		})
+		if len(b.Repos) == 0 {
+			unnamed++
+			continue
+		}
+		for _, r := range b.Repos {
+			repoSet[r] = true
+		}
 	}
+	repos := make([]string, 0, len(repoSet))
+	for r := range repoSet {
+		repos = append(repos, r)
+	}
+	sort.Strings(repos)
+	for _, r := range repos {
+		// One repo:tag line per tag seen (like registry:2); bare repo if the
+		// image was pulled by digest, so no human tag was ever requested.
+		if tags := st.Tags[r]; len(tags) > 0 {
+			for _, t := range tags {
+				l.Objects = append(l.Objects, Object{Name: r + ":" + t})
+			}
+		} else {
+			l.Objects = append(l.Objects, Object{Name: r})
+		}
+	}
+	if unnamed > 0 {
+		l.Objects = append(l.Objects, Object{Name: fmt.Sprintf("(%d unnamed layer(s) — re-pull to record)", unnamed)})
+	}
+	l.Note = "shared layers, size is the cache total"
 }
 
 func (e *Engine) httpJSON(ctx context.Context, port int, path string, v any) error {
