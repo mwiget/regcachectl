@@ -119,6 +119,34 @@ func run(ctx context.Context, argv []string) error {
 		fmt.Println("Garbage-collecting caches:")
 		return e.GC(ctx)
 
+	case "export":
+		fs := flag.NewFlagSet("export", flag.ExitOnError)
+		f := addRuntimeFlags(fs)
+		out := fs.String("o", "regcache-export.tgz", "output bundle path (.tgz)")
+		_ = fs.Parse(rest)
+		if a := fs.Args(); len(a) > 0 { // allow `export <file.tgz>` positional too
+			*out = a[0]
+		}
+		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase)
+		if err != nil {
+			return err
+		}
+		return e.Export(ctx, *out)
+
+	case "import":
+		fs := flag.NewFlagSet("import", flag.ExitOnError)
+		f := addRuntimeFlags(fs)
+		_ = fs.Parse(rest)
+		a := fs.Args()
+		if len(a) == 0 {
+			return fmt.Errorf("import: bundle path required (regcachectl import <file.tgz>)")
+		}
+		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase)
+		if err != nil {
+			return err
+		}
+		return e.Import(ctx, a[0])
+
 	case "print-registries":
 		fs := flag.NewFlagSet("print-registries", flag.ExitOnError)
 		host := fs.String("host", cache.DefaultHost, "address k3s nodes use to reach the host")
@@ -269,6 +297,8 @@ COMMANDS:
   down               stop & remove the fleet (--purge also drops cached blobs)
   status             show per-cache state, disk use, reachability
   list (ls)          list cached objects + space (-objects for full inventory)
+  export [-o f.tgz]  bundle every cache's data into one .tgz to copy elsewhere
+  import <f.tgz>     unpack a bundle into this host's cache volumes (seeds offline)
   gc                 run registry garbage-collect in each public cache
   print-registries   emit the k3s registries.yaml snippet to wire nodes
   serve-blobcache    (internal) run the credential-free blob cache; used by the

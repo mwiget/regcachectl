@@ -65,6 +65,8 @@ regcachectl status                              # state, disk use, reachability
 regcachectl list                                # cached objects + space per cache
 regcachectl list --objects                      # image-level inventory (repo:tag) for every cache
 regcachectl list --blobs                        # F5 cache: per-layer digests + sizes + the images they belong to
+regcachectl export -o regcache.tgz              # bundle every cache into one .tgz to copy to another host
+regcachectl import regcache.tgz                 # unpack a bundle into this host's cache volumes (offline seed)
 regcachectl print-registries > registries.yaml  # the k3s wiring snippet
 regcachectl gc                                   # reclaim space in the public caches
 regcachectl down                                 # stop & remove (keeps cached blobs)
@@ -149,6 +151,28 @@ Mount it into each k3s node at `/etc/rancher/k3s/registries.yaml` and give the
 node containers `--add-host host.docker.internal:host-gateway` so they can reach
 the host-published caches. (In tmmlitectl this is the opt-in `cluster.registry_cache`
 poc.yaml knob — see that repo. For manual use, pass `--host <bridge-gateway-ip>`.)
+
+### Moving the cache to another host
+
+`export` bundles every cache's on-disk data into one `.tgz`; `import` unpacks it
+into another host's cache volumes — so you can warm a second machine **offline**,
+without re-pulling gigabytes from the upstreams:
+
+```bash
+regcachectl export -o regcache.tgz      # on the warm host  → one .tgz
+scp regcache.tgz other-host:            # copy it across
+# on the other host:
+regcachectl import regcache.tgz         # unpack into the cache volumes
+regcachectl up                          # serve it
+```
+
+Both stream through a throwaway helper container (the already-present registry
+image, which has `tar`) that mounts the volumes — `export` read-only, so the
+fleet keeps serving while you bundle. Cache data is content-addressed and
+immutable, so `import` is a safe **union**: it seeds a fresh fleet or merges into
+an existing one without clobbering blobs. The image names + tags ride along (the
+sidecar index is part of each volume), so the imported `list --objects` reads
+identically on the new host.
 
 ### Surviving reboots
 
