@@ -93,7 +93,7 @@ func (e *Engine) fillRegistry2(ctx context.Context, u Upstream, l *Listing) {
 				l.Objects = append(l.Objects, Object{Name: repo}) // repo cached, no tag or revision resolved
 				continue
 			}
-			digs := strings.Fields(revs)
+			digs := e.primaryRevisions(ctx, u, strings.Fields(revs))
 			sort.Strings(digs)
 			for _, d := range digs {
 				l.Objects = append(l.Objects, Object{Name: repo + "@" + ShortDigest("sha256:"+d)})
@@ -106,6 +106,33 @@ func (e *Engine) fillRegistry2(ctx context.Context, u Upstream, l *Listing) {
 			l.Objects = append(l.Objects, Object{Name: repo + ":" + t})
 		}
 	}
+}
+
+// primaryRevisions collapses a digest-pulled repo's manifest revisions to the
+// image-index (manifest-list) digest(s) the user actually pinned, dropping the
+// per-platform child manifests that the index references — they're pulled as a
+// side effect of the index and would otherwise show as extra @digest lines.
+// Falls back to all revisions for a single-arch image (no index among them).
+func (e *Engine) primaryRevisions(ctx context.Context, u Upstream, digs []string) []string {
+	var indexes []string
+	for _, d := range digs {
+		if len(d) < 2 {
+			continue
+		}
+		blob := "/var/lib/registry/docker/registry/v2/blobs/sha256/" + d[:2] + "/" + d + "/data"
+		content, err := e.run(ctx, "exec", container(u), "cat", blob)
+		if err != nil {
+			continue
+		}
+		// OCI image-index or Docker manifest-list — the multi-arch top level.
+		if strings.Contains(content, "manifest.list") || strings.Contains(content, "image.index") {
+			indexes = append(indexes, d)
+		}
+	}
+	if len(indexes) > 0 {
+		return indexes
+	}
+	return digs
 }
 
 // ShortDigest abbreviates a sha256:<64hex> digest to sha256:<first 12 hex> for

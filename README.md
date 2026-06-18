@@ -114,7 +114,8 @@ neither of which is a credential:
   is ever sent), so it lists as `repo@sha256:short` instead of `repo:tag` — it
   reads as "pinned by digest", not "missing a tag". The `registry:2` caches do
   the same: a digest-pulled image (e.g. Cilium, whose helm chart pins by digest)
-  shows `repo@sha256:short` read from its on-disk manifest revisions.
+  shows `repo@sha256:short` — the image-index digest read from its on-disk
+  manifest revisions, with the per-platform child manifests collapsed away.
 
 Both are captured on **every** request — including a cache HIT — so the names and
 tags fill in the next time any pull touches the image, even a fully warm redeploy
