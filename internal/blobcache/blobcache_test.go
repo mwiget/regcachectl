@@ -194,8 +194,10 @@ func TestRecordsRepoNames(t *testing.T) {
 	}
 }
 
-// TestRecordsTags: a manifest GET by tag is relayed (not cached) but the
-// repo→tag is recorded; a manifest by digest records no tag.
+// TestRecordsTags: a manifest GET by tag OR by digest is relayed (not cached)
+// but the reference is recorded — both, so a digest-pinned image can still be
+// shown (as repo@digest) instead of reading as a missing tag. The list layer
+// prefers the tag when both are present.
 func TestRecordsTags(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.WriteString(w, "manifest-bytes")
@@ -205,18 +207,21 @@ func TestRecordsTags(t *testing.T) {
 	srv := httptest.NewServer(p)
 	defer srv.Close()
 
-	// pull-by-tag records the tag; pull-by-digest records nothing.
+	dg := "sha256:" + strings.Repeat("a", 64)
 	get(t, srv.URL+"/v2/images/tmm-img/manifests/v2.3.0")
-	get(t, srv.URL+"/v2/images/tmm-img/manifests/sha256:"+strings.Repeat("a", 64))
-	// a layer GET so the image shows up in stats with a repo.
-	blob := []byte("layer")
-	get(t, srv.URL+"/v2/images/tmm-img/blobs/"+digestOf(blob))
+	get(t, srv.URL+"/v2/images/tmm-img/manifests/"+dg)
+	get(t, srv.URL+"/v2/images/cilium/manifests/"+dg) // digest-pinned, no tag
+	// layer GETs so the images show up in stats with a repo.
+	get(t, srv.URL+"/v2/images/tmm-img/blobs/"+digestOf([]byte("a")))
+	get(t, srv.URL+"/v2/images/cilium/blobs/"+digestOf([]byte("b")))
 
 	var st Stats
 	getJSON(t, srv.URL+"/_cache", &st)
-	got := st.Tags["images/tmm-img"]
-	if len(got) != 1 || got[0] != "v2.3.0" {
-		t.Fatalf("tags = %v, want [v2.3.0] (digest ref must not be recorded)", got)
+	if got := st.Tags["images/tmm-img"]; len(got) != 2 || got[0] != dg || got[1] != "v2.3.0" {
+		t.Fatalf("tmm-img refs = %v, want both [%s v2.3.0] (readRepos sorts)", got, dg)
+	}
+	if got := st.Tags["images/cilium"]; len(got) != 1 || got[0] != dg {
+		t.Fatalf("cilium refs = %v, want [%s] (digest only)", got, dg)
 	}
 }
 

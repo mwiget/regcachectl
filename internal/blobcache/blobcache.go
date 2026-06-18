@@ -169,11 +169,13 @@ func (p *Proxy) tagsPath(repo string) string {
 	return filepath.Join(p.cacheDir, "tags", url.QueryEscape(repo))
 }
 
-// recordTag notes that repo was requested at tag ref. A digest reference carries
-// no human tag, so it is ignored. Like recordRepo this fires on every manifest
-// request (relayed, never cached), so a warm re-pull still records the tag.
+// recordTag notes the reference repo was requested at — a tag or a digest
+// (`sha256:…`). Both are kept (the listing prefers tags and falls back to a
+// `@digest` for digest-pinned images, so they don't read as "missing a tag").
+// Fires on every manifest request (relayed, never cached), so a warm re-pull
+// still records it.
 func (p *Proxy) recordTag(repo, ref string) {
-	if repo == "" || ref == "" || strings.HasPrefix(ref, "sha256:") {
+	if repo == "" || ref == "" {
 		return
 	}
 	p.mu.Lock()

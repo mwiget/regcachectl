@@ -83,9 +83,21 @@ func (e *Engine) fillRegistry2(ctx context.Context, u Upstream, l *Listing) {
 	for _, repo := range cat.Repositories {
 		// Cached tags = the manifest tag dirs on disk (NOT the proxied API).
 		tagsDir := "/var/lib/registry/docker/registry/v2/repositories/" + repo + "/_manifests/tags"
-		out, err := e.run(ctx, "exec", container(u), "ls", "-1", tagsDir)
-		if err != nil || strings.TrimSpace(out) == "" {
-			l.Objects = append(l.Objects, Object{Name: repo}) // repo cached, no resolved tag
+		out, _ := e.run(ctx, "exec", container(u), "ls", "-1", tagsDir)
+		if strings.TrimSpace(out) == "" {
+			// no tag → pulled by digest; show repo@sha256:short from the on-disk
+			// manifest revisions so it doesn't read as a missing tag.
+			revDir := "/var/lib/registry/docker/registry/v2/repositories/" + repo + "/_manifests/revisions/sha256"
+			revs, _ := e.run(ctx, "exec", container(u), "ls", "-1", revDir)
+			if strings.TrimSpace(revs) == "" {
+				l.Objects = append(l.Objects, Object{Name: repo}) // repo cached, no tag or revision resolved
+				continue
+			}
+			digs := strings.Fields(revs)
+			sort.Strings(digs)
+			for _, d := range digs {
+				l.Objects = append(l.Objects, Object{Name: repo + "@" + ShortDigest("sha256:"+d)})
+			}
 			continue
 		}
 		tags := strings.Fields(out)
@@ -94,6 +106,16 @@ func (e *Engine) fillRegistry2(ctx context.Context, u Upstream, l *Listing) {
 			l.Objects = append(l.Objects, Object{Name: repo + ":" + t})
 		}
 	}
+}
+
+// ShortDigest abbreviates a sha256:<64hex> digest to sha256:<first 12 hex> for
+// display — enough to identify a digest-pinned image without the full hash.
+func ShortDigest(d string) string {
+	const n = len("sha256:") + 12
+	if len(d) > n {
+		return d[:n]
+	}
+	return d
 }
 
 // fillBlobcache reads the digest-keyed inventory from the blob cache's /_cache
@@ -141,13 +163,27 @@ func (e *Engine) fillBlobcache(ctx context.Context, l *Listing) {
 	}
 	sort.Strings(repos)
 	for _, r := range repos {
-		// One repo:tag line per tag seen (like registry:2); bare repo if the
-		// image was pulled by digest, so no human tag was ever requested.
-		if tags := st.Tags[r]; len(tags) > 0 {
+		// Prefer human tags (repo:tag, like registry:2). For a digest-pinned
+		// image no tag is ever requested, so fall back to repo@sha256:short so it
+		// reads as "pinned by digest", not "missing a tag".
+		var tags, digests []string
+		for _, ref := range st.Tags[r] {
+			if strings.HasPrefix(ref, "sha256:") {
+				digests = append(digests, ref)
+			} else {
+				tags = append(tags, ref)
+			}
+		}
+		switch {
+		case len(tags) > 0:
 			for _, t := range tags {
 				l.Objects = append(l.Objects, Object{Name: r + ":" + t})
 			}
-		} else {
+		case len(digests) > 0:
+			for _, d := range digests {
+				l.Objects = append(l.Objects, Object{Name: r + "@" + ShortDigest(d)})
+			}
+		default:
 			l.Objects = append(l.Objects, Object{Name: r})
 		}
 	}
