@@ -37,10 +37,14 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 )
 
-// blobRe matches a registry v2 blob path and captures the sha256 digest.
-var blobRe = regexp.MustCompile(`^/v2/.+/blobs/(sha256:[0-9a-f]{64})$`)
+// blobRe matches a registry v2 blob path and captures the repo name and the
+// sha256 digest. The repo (the greedy `.+` before /blobs/) is recorded per
+// digest so `list --objects` can name otherwise-anonymous blobs; it is never a
+// credential, so capturing it preserves the credential-free posture.
+var blobRe = regexp.MustCompile(`^/v2/(.+)/blobs/(sha256:[0-9a-f]{64})$`)
 
 // Proxy is the caching reverse proxy for one upstream.
 type Proxy struct {
@@ -50,6 +54,7 @@ type Proxy struct {
 	upClient *http.Client           // talks to upstream; does NOT auto-follow redirects
 	dlClient *http.Client           // fetches the pre-signed redirect target (no auth)
 	log      *log.Logger
+	mu       sync.Mutex // guards repo-sidecar writes
 }
 
 // New builds a Proxy for upstream (e.g. https://repo.f5.com), caching blobs
@@ -88,7 +93,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if m := blobRe.FindStringSubmatch(r.URL.Path); m != nil && r.Method == http.MethodGet {
-		p.serveBlob(w, r, m[1])
+		p.serveBlob(w, r, m[1], m[2])
 		return
 	}
 	// Everything else (manifests, /v2/, token, blob HEAD) is a transparent,
@@ -100,7 +105,58 @@ func (p *Proxy) blobPath(digest string) string {
 	return filepath.Join(p.cacheDir, "blobs", strings.TrimPrefix(digest, "sha256:"))
 }
 
-func (p *Proxy) serveBlob(w http.ResponseWriter, r *http.Request, digest string) {
+func (p *Proxy) reposPath(digest string) string {
+	return filepath.Join(p.cacheDir, "repos", strings.TrimPrefix(digest, "sha256:"))
+}
+
+// recordRepo notes that digest was requested under repo, persisting a
+// newline-separated sidecar (deduped) so the listing can name the blob. The
+// repo is taken from the request path, so a HIT names already-cached blobs too.
+func (p *Proxy) recordRepo(digest, repo string) {
+	if repo == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	rp := p.reposPath(digest)
+	for _, e := range readRepos(rp) {
+		if e == repo {
+			return
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(rp), 0o755); err != nil {
+		return
+	}
+	f, err := os.OpenFile(rp, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	f.WriteString(repo + "\n")
+}
+
+// readRepos returns the deduped repo names recorded for a blob (empty if none).
+func readRepos(path string) []string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, ln := range strings.Split(string(b), "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" || seen[ln] {
+			continue
+		}
+		seen[ln] = true
+		out = append(out, ln)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (p *Proxy) serveBlob(w http.ResponseWriter, r *http.Request, repo, digest string) {
+	p.recordRepo(digest, repo)
 	path := p.blobPath(digest)
 	if fi, err := os.Stat(path); err == nil {
 		f, err := os.Open(path)
@@ -224,10 +280,12 @@ type Stats struct {
 	Blobs      []BlobInfo `json:"blobs"`
 }
 
-// BlobInfo is one cached blob.
+// BlobInfo is one cached blob, with the repo name(s) it was served under (if
+// any were recorded). A blob can be shared across repos, hence a slice.
 type BlobInfo struct {
-	Digest string `json:"digest"`
-	Size   int64  `json:"size"`
+	Digest string   `json:"digest"`
+	Size   int64    `json:"size"`
+	Repos  []string `json:"repos,omitempty"`
 }
 
 func (p *Proxy) stats() Stats {
@@ -244,7 +302,11 @@ func (p *Proxy) stats() Stats {
 		if err != nil {
 			continue
 		}
-		st.Blobs = append(st.Blobs, BlobInfo{Digest: "sha256:" + e.Name(), Size: fi.Size()})
+		st.Blobs = append(st.Blobs, BlobInfo{
+			Digest: "sha256:" + e.Name(),
+			Size:   fi.Size(),
+			Repos:  readRepos(p.reposPath("sha256:" + e.Name())),
+		})
 		st.TotalBytes += fi.Size()
 		st.Count++
 	}

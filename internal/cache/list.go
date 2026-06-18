@@ -26,8 +26,9 @@ type Listing struct {
 // Object is one cached item: a repo:tag (registry:2) or a blob digest
 // (blobcache, with an exact size).
 type Object struct {
-	Name string
-	Size string // "" when size is not attributable per-object
+	Name   string
+	Size   string // "" when size is not attributable per-object
+	Detail string // optional trailing column (e.g. repo names for a blob)
 }
 
 // List gathers the cached objects + space for every cache in the fleet.
@@ -101,8 +102,9 @@ func (e *Engine) fillBlobcache(ctx context.Context, l *Listing) {
 		Count      int   `json:"count"`
 		TotalBytes int64 `json:"total_bytes"`
 		Blobs      []struct {
-			Digest string `json:"digest"`
-			Size   int64  `json:"size"`
+			Digest string   `json:"digest"`
+			Size   int64    `json:"size"`
+			Repos  []string `json:"repos"`
 		} `json:"blobs"`
 	}
 	if err := e.httpJSON(ctx, l.Port, "/_cache", &st); err != nil {
@@ -111,7 +113,11 @@ func (e *Engine) fillBlobcache(ctx context.Context, l *Listing) {
 	l.Bytes = st.TotalBytes
 	l.Size = HumanBytes(st.TotalBytes)
 	for _, b := range st.Blobs {
-		l.Objects = append(l.Objects, Object{Name: b.Digest, Size: HumanBytes(b.Size)})
+		l.Objects = append(l.Objects, Object{
+			Name:   b.Digest,
+			Size:   HumanBytes(b.Size),
+			Detail: strings.Join(b.Repos, ", "),
+		})
 	}
 }
 
