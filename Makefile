@@ -10,7 +10,7 @@ build:
 	go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BIN) .
 
 install: build blobcache-image
-	install -D -m 0755 $(BIN) $(HOME)/.local/bin/regcachectl
+	install -m 0755 $(BIN) $(HOME)/.local/bin/regcachectl
 	@echo "installed -> $(HOME)/.local/bin/regcachectl"
 
 # blobcache-image builds the credential-free repo.f5.com blob-cache image from a
