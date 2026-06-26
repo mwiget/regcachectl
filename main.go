@@ -108,6 +108,21 @@ func run(ctx context.Context, argv []string) error {
 		}
 		return printList(ctx, e, *objects || *blobs, *blobs)
 
+	case "pull":
+		fs := flag.NewFlagSet("pull", flag.ExitOnError)
+		f := addRuntimeFlags(fs)
+		creds := fs.String("creds", "", "upstream creds user:password for the token endpoint (nvcr.io defaults to $oauthtoken:<~/.ngc>)")
+		_ = fs.Parse(rest)
+		refs := fs.Args()
+		if len(refs) == 0 {
+			return fmt.Errorf("pull: at least one image ref required (e.g. regcachectl pull nvcr.io/nvidia/doca/dpf-system:v26.4.0)")
+		}
+		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase)
+		if err != nil {
+			return err
+		}
+		return e.Pull(ctx, refs, *creds)
+
 	case "gc":
 		fs := flag.NewFlagSet("gc", flag.ExitOnError)
 		f := addRuntimeFlags(fs)
@@ -297,6 +312,9 @@ COMMANDS:
   down               stop & remove the fleet (--purge also drops cached blobs)
   status             show per-cache state, disk use, reachability
   list (ls)          list cached objects + space (-objects for full inventory)
+  pull <ref>…        warm a cache with EVERY platform of an image (multi-arch),
+                     so export/import carries all arches (nvcr.io: needs an NGC
+                     key in ~/.ngc or --creds '$oauthtoken:<key>')
   export [-o f.tgz]  bundle every cache's data into one .tgz to copy elsewhere
   import <f.tgz>     unpack a bundle into this host's cache volumes (seeds offline)
   gc                 run registry garbage-collect in each public cache

@@ -33,6 +33,7 @@ collide). One pull-through cache per upstream maps 1:1 to k3s mirror semantics.
 | `regcache-ghcr` | `ghcr.io` | `registry:2` anonymous proxy | 5001 |
 | `regcache-quay` | `quay.io` | `registry:2` anonymous proxy | 5002 |
 | `regcache-f5` | `repo.f5.com` | credential-free blob cache | 5003 |
+| `regcache-nvcr` | `nvcr.io` | `registry:2` anonymous proxy (relays the client's NGC token) | 5004 |
 
 ## Authentication — the client supplies the key, not the cache
 
@@ -65,6 +66,7 @@ regcachectl status                              # state, disk use, reachability
 regcachectl list                                # cached objects + space per cache
 regcachectl list --objects                      # image-level inventory (repo:tag) for every cache
 regcachectl list --blobs                        # F5 cache: per-layer digests + sizes + the images they belong to
+regcachectl pull nvcr.io/nvidia/doca/dpf-system:v26.4.0   # warm a cache with EVERY platform of an image
 regcachectl export -o regcache.tgz              # bundle every cache into one .tgz to copy to another host
 regcachectl import regcache.tgz                 # unpack a bundle into this host's cache volumes (offline seed)
 regcachectl print-registries > registries.yaml  # the k3s wiring snippet
@@ -173,6 +175,33 @@ immutable, so `import` is a safe **union**: it seeds a fresh fleet or merges int
 an existing one without clobbering blobs. The image names + tags ride along (the
 sidecar index is part of each volume), so the imported `list --objects` reads
 identically on the new host.
+
+### Seeding a multi-arch image across an air gap (`pull`)
+
+`export`/`import` only carries what the cache already holds — and a `docker pull`
++ `docker save` keeps only the host platform (an arm64 Mac strips the amd64 image
+an x86 server needs, and `ctr import` then fails with "content digest … not
+found"). `regcachectl pull` fixes that by warming the cache with **every**
+platform: it walks the manifest index and fetches each child's config + layers
+through the cache, so the bundle is genuinely multi-arch.
+
+```bash
+# on a host that CAN reach nvcr.io (e.g. a Mac with an NGC key in ~/.ngc):
+regcachectl up
+regcachectl pull nvcr.io/nvidia/doca/dpf-system:v26.4.0   # all platforms → regcache-nvcr (:5004)
+regcachectl export -o regcache.tgz
+scp regcache.tgz blocked-host:
+
+# on the WAF-blocked host:
+regcachectl import regcache.tgz && regcachectl up         # serves nvcr.io HITs, no upstream contact
+regcachectl print-registries                              # wire k3s: mirrors "nvcr.io" → :5004
+```
+
+The fleet holds **no** credentials: `pull` mints the NGC bearer token from your
+`~/.ngc` (or `--creds '$oauthtoken:<key>'`) against nvcr.io's auth realm and
+replays it through the cache. Public multi-arch images warm anonymously
+(`regcachectl pull docker.io/library/redis:7`). Imported HITs serve without
+re-checking upstream auth, which is exactly what an air-gapped/blocked host needs.
 
 ### Surviving reboots
 

@@ -65,6 +65,13 @@ var Upstreams = []Upstream{
 	{Name: "ghcr", Host: "ghcr.io", Remote: "https://ghcr.io"},
 	{Name: "quay", Host: "quay.io", Remote: "https://quay.io"},
 	{Name: "f5", Host: "repo.f5.com", Remote: "https://repo.f5.com", Blobcache: true},
+	// nvcr.io (NGC) is auth-required for every pull. It runs as an anonymous
+	// registry:2 proxy like the public three — it holds no credentials and
+	// relays the client's bearer token upstream. Seed it with `regcachectl pull
+	// nvcr.io/...` (which supplies the NGC token, all platforms) on a host that
+	// can reach nvcr.io, then `export`/`import` carries the multi-arch image to a
+	// WAF-blocked host where it serves cached HITs without re-contacting nvcr.io.
+	{Name: "nvcr", Host: "nvcr.io", Remote: "https://nvcr.io"},
 }
 
 // Engine drives the fleet against a chosen runtime.
