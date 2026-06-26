@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -138,15 +139,22 @@ func run(ctx context.Context, argv []string) error {
 		fs := flag.NewFlagSet("export", flag.ExitOnError)
 		f := addRuntimeFlags(fs)
 		out := fs.String("o", "regcache-export.tgz", "output bundle path (.tgz)")
+		only := fs.String("cache", "", "comma-separated cache names to include, e.g. nvcr (default: all)")
 		_ = fs.Parse(rest)
 		if a := fs.Args(); len(a) > 0 { // allow `export <file.tgz>` positional too
 			*out = a[0]
+		}
+		var caches []string
+		for _, c := range strings.Split(*only, ",") {
+			if c = strings.TrimSpace(c); c != "" {
+				caches = append(caches, c)
+			}
 		}
 		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase)
 		if err != nil {
 			return err
 		}
-		return e.Export(ctx, *out)
+		return e.Export(ctx, *out, caches)
 
 	case "import":
 		fs := flag.NewFlagSet("import", flag.ExitOnError)

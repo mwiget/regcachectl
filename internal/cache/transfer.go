@@ -18,15 +18,26 @@ import (
 // under <cacheName>/… — the helper is the already-present registry image (it is
 // Alpine, so it has tar), adding no new dependency. Nothing here needs the
 // caches to be stopped; the volumes are mounted read-only.
-func (e *Engine) Export(ctx context.Context, outPath string) error {
+// only restricts the export to the named caches (e.g. {"nvcr"}); empty means all.
+func (e *Engine) Export(ctx context.Context, outPath string, only []string) error {
+	want := map[string]bool{}
+	for _, n := range only {
+		want[n] = true
+	}
 	var mounts, names []string
 	for _, u := range Upstreams {
+		if len(want) > 0 && !want[u.Name] {
+			continue
+		}
 		if e.volumeExists(ctx, volume(u)) {
 			mounts = append(mounts, "-v", volume(u)+":/caches/"+u.Name+":ro")
 			names = append(names, u.Name)
 		}
 	}
 	if len(names) == 0 {
+		if len(want) > 0 {
+			return fmt.Errorf("no matching cache volumes for %s (known: %s)", strings.Join(only, ", "), knownCaches())
+		}
 		return errors.New("no cache volumes to export — run `up` and pull some images first")
 	}
 	helper := e.ImageName()

@@ -86,6 +86,14 @@ func knownHosts() string {
 	return strings.Join(hs, ", ")
 }
 
+func knownCaches() string {
+	ns := make([]string, len(Upstreams))
+	for i, u := range Upstreams {
+		ns[i] = u.Name
+	}
+	return strings.Join(ns, ", ")
+}
+
 func (e *Engine) pullOne(ctx context.Context, raw, creds string) error {
 	rf, err := parseRef(raw)
 	if err != nil {

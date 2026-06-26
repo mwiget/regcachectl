@@ -68,6 +68,7 @@ regcachectl list --objects                      # image-level inventory (repo:ta
 regcachectl list --blobs                        # F5 cache: per-layer digests + sizes + the images they belong to
 regcachectl pull nvcr.io/nvidia/doca/dpf-system:v26.4.0   # warm a cache with EVERY platform of an image
 regcachectl export -o regcache.tgz              # bundle every cache into one .tgz to copy to another host
+regcachectl export -o nvcr.tgz --cache nvcr     # bundle only one cache (e.g. just the warmed nvcr image)
 regcachectl import regcache.tgz                 # unpack a bundle into this host's cache volumes (offline seed)
 regcachectl print-registries > registries.yaml  # the k3s wiring snippet
 regcachectl gc                                   # reclaim space in the public caches
