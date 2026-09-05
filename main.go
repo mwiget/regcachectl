@@ -53,14 +53,28 @@ func run(ctx context.Context, argv []string) error {
 	type rtFlags struct {
 		runtime, image, host *string
 		portBase             *int
+		fs                   *flag.FlagSet
 	}
 	addRuntimeFlags := func(fs *flag.FlagSet) rtFlags {
 		return rtFlags{
 			runtime:  fs.String("runtime", "", "container runtime (docker|podman; autodetect if empty)"),
 			image:    fs.String("image", "", "registry image override (default "+cache.RegistryImage+")"),
 			host:     fs.String("host", cache.DefaultHost, "address k3s nodes use to reach the host"),
-			portBase: fs.Int("port-base", cache.DefaultPortBase, "host port of the first cache"),
+			portBase: fs.Int("port-base", cache.DefaultPortBase, "host port of the first cache (default: the running fleet's)"),
+			fs:       fs,
 		}
+	}
+	// portBaseSet reports whether --port-base was actually typed. It cannot be
+	// inferred by comparing against DefaultPortBase: `--port-base 5000` on a
+	// fleet running elsewhere is a deliberate override, not an absent flag.
+	portBaseSet := func(fs *flag.FlagSet) bool {
+		seen := false
+		fs.Visit(func(fl *flag.Flag) {
+			if fl.Name == "port-base" {
+				seen = true
+			}
+		})
+		return seen
 	}
 
 	switch cmd {
@@ -68,7 +82,7 @@ func run(ctx context.Context, argv []string) error {
 		fs := flag.NewFlagSet("up", flag.ExitOnError)
 		f := addRuntimeFlags(fs)
 		_ = fs.Parse(rest)
-		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase)
+		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase, portBaseSet(f.fs))
 		if err != nil {
 			return err
 		}
@@ -80,7 +94,7 @@ func run(ctx context.Context, argv []string) error {
 		f := addRuntimeFlags(fs)
 		purge := fs.Bool("purge", false, "also delete cached blobs (volumes)")
 		_ = fs.Parse(rest)
-		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase)
+		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase, portBaseSet(f.fs))
 		if err != nil {
 			return err
 		}
@@ -91,7 +105,7 @@ func run(ctx context.Context, argv []string) error {
 		fs := flag.NewFlagSet("status", flag.ExitOnError)
 		f := addRuntimeFlags(fs)
 		_ = fs.Parse(rest)
-		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase)
+		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase, portBaseSet(f.fs))
 		if err != nil {
 			return err
 		}
@@ -103,7 +117,7 @@ func run(ctx context.Context, argv []string) error {
 		objects := fs.Bool("objects", false, "list cached images (repo:tag, or repo name for F5 blobs), not just totals")
 		blobs := fs.Bool("blobs", false, "for the F5 blob cache, list individual layer digests + sizes instead of image names")
 		_ = fs.Parse(rest)
-		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase)
+		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase, portBaseSet(f.fs))
 		if err != nil {
 			return err
 		}
@@ -118,7 +132,7 @@ func run(ctx context.Context, argv []string) error {
 		if len(refs) == 0 {
 			return fmt.Errorf("pull: at least one image ref required (e.g. regcachectl pull nvcr.io/nvidia/doca/dpf-system:v26.4.0)")
 		}
-		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase)
+		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase, portBaseSet(f.fs))
 		if err != nil {
 			return err
 		}
@@ -128,7 +142,7 @@ func run(ctx context.Context, argv []string) error {
 		fs := flag.NewFlagSet("gc", flag.ExitOnError)
 		f := addRuntimeFlags(fs)
 		_ = fs.Parse(rest)
-		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase)
+		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase, portBaseSet(f.fs))
 		if err != nil {
 			return err
 		}
@@ -150,7 +164,7 @@ func run(ctx context.Context, argv []string) error {
 				caches = append(caches, c)
 			}
 		}
-		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase)
+		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase, portBaseSet(f.fs))
 		if err != nil {
 			return err
 		}
@@ -164,7 +178,7 @@ func run(ctx context.Context, argv []string) error {
 		if len(a) == 0 {
 			return fmt.Errorf("import: bundle path required (regcachectl import <file.tgz>)")
 		}
-		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase)
+		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase, portBaseSet(f.fs))
 		if err != nil {
 			return err
 		}
@@ -176,7 +190,15 @@ func run(ctx context.Context, argv []string) error {
 		portBase := fs.Int("port-base", cache.DefaultPortBase, "host port of the first cache")
 		noFallback := fs.Bool("no-fallback", false, "omit the direct-upstream fallback endpoint")
 		_ = fs.Parse(rest)
-		e := &cache.Engine{PortBase: *portBase}
+		// Emitting mirror endpoints for the wrong ports is the costliest way
+		// to get the port base wrong — the cluster looks correctly wired and
+		// silently pulls from upstream — so discover the running fleet's
+		// ports here too. No runtime (or no fleet) falls back to the flag,
+		// keeping this usable for generating config on a bare host.
+		e, err := buildEngine(ctx, "", "", *portBase, portBaseSet(fs))
+		if err != nil {
+			e = &cache.Engine{PortBase: *portBase, PortBaseSet: portBaseSet(fs)}
+		}
 		fmt.Print(e.RenderRegistries(*host, !*noFallback))
 		return nil
 
@@ -215,13 +237,24 @@ func run(ctx context.Context, argv []string) error {
 	}
 }
 
-// buildEngine resolves the runtime and applies the image/port overrides.
-func buildEngine(ctx context.Context, runtime, image string, portBase int) (*cache.Engine, error) {
+// buildEngine resolves the runtime and applies the image/port overrides, then
+// learns the running fleet's actual ports. Without an explicit --port-base
+// those discovered ports win, so a fleet on a non-default base answers every
+// command; with one, a disagreement is reported rather than silently probing
+// ports nothing listens on.
+func buildEngine(ctx context.Context, runtime, image string, portBase int, portBaseSet bool) (*cache.Engine, error) {
 	rt, err := cache.DetectRuntime(ctx, runtime)
 	if err != nil {
 		return nil, err
 	}
-	return &cache.Engine{Runtime: rt, Image: image, PortBase: portBase, Out: os.Stdout}, nil
+	e := &cache.Engine{Runtime: rt, Image: image, PortBase: portBase, PortBaseSet: portBaseSet, Out: os.Stdout}
+	e.DiscoverPorts(ctx)
+	if portBaseSet {
+		for _, m := range e.PortMismatch() {
+			fmt.Fprintln(os.Stderr, "regcachectl: warning:", m)
+		}
+	}
+	return e, nil
 }
 
 func printStatus(ctx context.Context, e *cache.Engine) error {

@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strconv"
 	"strings"
 )
 
@@ -79,7 +80,16 @@ type Engine struct {
 	Runtime  string // "docker" or "podman"
 	Image    string // override RegistryImage
 	PortBase int
-	Out      io.Writer
+	// PortBaseSet reports that PortBase came from an explicit --port-base
+	// flag. When false, DiscoverPorts asks the running fleet which ports it
+	// actually publishes, so a fleet brought up on a non-default base stays
+	// addressable without repeating the flag on every command.
+	PortBaseSet bool
+	Out         io.Writer
+
+	// ports maps an upstream name to the host port its container publishes,
+	// filled by DiscoverPorts. Empty until then (and for absent caches).
+	ports map[string]int
 }
 
 // ImageName is the effective registry image (override or default).
@@ -97,8 +107,62 @@ func (e *Engine) portBase() int {
 	return DefaultPortBase
 }
 
-// Port returns the host port for upstream index i.
-func (e *Engine) Port(i int) int { return e.portBase() + i }
+// Port returns the host port for upstream index i: the port the existing
+// container actually publishes (see DiscoverPorts) when one was found and
+// --port-base was not given explicitly, else portBase+i.
+func (e *Engine) Port(i int) int {
+	if !e.PortBaseSet && i >= 0 && i < len(Upstreams) {
+		if p, ok := e.ports[Upstreams[i].Name]; ok && p > 0 {
+			return p
+		}
+	}
+	return e.portBase() + i
+}
+
+// DiscoverPorts records the host port each existing cache container publishes,
+// so read-only commands (list/status/print-registries/…) address the fleet
+// that is actually running instead of the compiled-in default base. Reading
+// the port from the container — the `tmm-regcache.port` label, falling back to
+// the 5000/tcp binding for containers created before that label existed —
+// keeps the fleet self-describing: no state file to go stale, and a fleet
+// created from another shell is still found.
+//
+// Best-effort: a runtime that cannot be queried leaves the defaults in place.
+func (e *Engine) DiscoverPorts(ctx context.Context) {
+	if e.Runtime == "" {
+		return
+	}
+	found := map[string]int{}
+	for _, u := range Upstreams {
+		const format = `{{index .Config.Labels "tmm-regcache.port"}}|` +
+			`{{range $b := index .HostConfig.PortBindings "5000/tcp"}}{{$b.HostPort}}{{end}}`
+		out, err := e.run(ctx, "inspect", "--format", format, container(u))
+		if err != nil {
+			continue // absent container: nothing to discover
+		}
+		labelled, bound, _ := strings.Cut(lastLine(out), "|")
+		for _, cand := range []string{labelled, bound} {
+			if p, err := strconv.Atoi(strings.TrimSpace(cand)); err == nil && p > 0 {
+				found[u.Name] = p
+				break
+			}
+		}
+	}
+	e.ports = found
+}
+
+// PortMismatch reports the caches whose running container publishes a port
+// other than the one an explicit --port-base asks for, so a caller can warn
+// instead of silently probing ports nothing listens on.
+func (e *Engine) PortMismatch() []string {
+	var out []string
+	for i, u := range Upstreams {
+		if p, ok := e.ports[u.Name]; ok && p > 0 && p != e.portBase()+i {
+			out = append(out, fmt.Sprintf("%s runs on :%d, not :%d", u.Name, p, e.portBase()+i))
+		}
+	}
+	return out
+}
 
 func container(u Upstream) string { return containerPrefix + u.Name }
 func volume(u Upstream) string    { return volumePrefix + u.Name }
@@ -202,6 +266,9 @@ func (e *Engine) runArgs(u Upstream, port int) []string {
 		"--name", container(u),
 		"--label", label,
 		"--label", "tmm-regcache.host=" + u.Host,
+		// The published port, so later commands can discover where this
+		// fleet lives instead of assuming DefaultPortBase (DiscoverPorts).
+		"--label", "tmm-regcache.port=" + strconv.Itoa(port),
 		"--restart=always",
 		"-p", fmt.Sprintf("%d:5000", port),
 	}
