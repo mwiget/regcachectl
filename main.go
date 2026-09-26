@@ -11,7 +11,7 @@
 //	regcachectl up [--far-key keys/f5-far-auth-key.tgz]
 //	regcachectl status
 //	regcachectl print-registries [--format k3s|crio|okd] [--host host.docker.internal] [--no-fallback]
-//	regcachectl pull-release <release-ref> [--platform linux/amd64] [-j 4]
+//	regcachectl pull-release <release-ref> [-j 4] [--platform linux/amd64]
 //	regcachectl gc [--delete-untagged]
 //	regcachectl down [--purge]
 //	regcachectl install-systemd [--far-key …] [--write]
@@ -139,8 +139,7 @@ func run(ctx context.Context, argv []string) error {
 		fs := flag.NewFlagSet("pull", flag.ExitOnError)
 		f := addRuntimeFlags(fs)
 		creds := fs.String("creds", "", "upstream creds user:password for the token endpoint (nvcr.io defaults to $oauthtoken:<~/.ngc>)")
-		_ = fs.Parse(rest)
-		refs := fs.Args()
+		refs := parseArgs(fs, rest)
 		if len(refs) == 0 {
 			return fmt.Errorf("pull: at least one image ref required (e.g. regcachectl pull nvcr.io/nvidia/doca/dpf-system:v26.4.0)")
 		}
@@ -156,15 +155,18 @@ func run(ctx context.Context, argv []string) error {
 		platform := fs.String("platform", cache.DefaultReleasePlatform, "platform of multi-arch payload images to warm (empty = all)")
 		jobs := fs.Int("j", 4, "payload images warmed concurrently")
 		creds := fs.String("creds", "", "upstream creds user:password for the token endpoint")
-		_ = fs.Parse(rest)
-		if fs.NArg() != 1 {
-			return fmt.Errorf("pull-release: exactly one release image required (e.g. regcachectl pull-release quay.io/okd/scos-release:4.22.0-okd-scos.10)")
+		args := parseArgs(fs, rest)
+		if len(args) != 1 {
+			return fmt.Errorf("pull-release: exactly one release image required (e.g. regcachectl pull-release quay.io/okd/scos-release:4.22.0-okd-scos.10 -j 8)")
+		}
+		if *jobs < 1 {
+			return fmt.Errorf("pull-release: -j must be at least 1")
 		}
 		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase, portBaseSet(f.fs))
 		if err != nil {
 			return err
 		}
-		return e.PullRelease(ctx, fs.Arg(0), *platform, *jobs, *creds)
+		return e.PullRelease(ctx, args[0], *platform, *jobs, *creds)
 
 	case "gc":
 		fs := flag.NewFlagSet("gc", flag.ExitOnError)
@@ -187,8 +189,7 @@ func run(ctx context.Context, argv []string) error {
 		f := addRuntimeFlags(fs)
 		out := fs.String("o", "regcache-export.tgz", "output bundle path (.tgz)")
 		only := fs.String("cache", "", "comma-separated cache names to include, e.g. nvcr (default: all)")
-		_ = fs.Parse(rest)
-		if a := fs.Args(); len(a) > 0 { // allow `export <file.tgz>` positional too
+		if a := parseArgs(fs, rest); len(a) > 0 { // allow `export <file.tgz>` positional too
 			*out = a[0]
 		}
 		var caches []string
@@ -206,8 +207,7 @@ func run(ctx context.Context, argv []string) error {
 	case "import":
 		fs := flag.NewFlagSet("import", flag.ExitOnError)
 		f := addRuntimeFlags(fs)
-		_ = fs.Parse(rest)
-		a := fs.Args()
+		a := parseArgs(fs, rest)
 		if len(a) == 0 {
 			return fmt.Errorf("import: bundle path required (regcachectl import <file.tgz>)")
 		}
@@ -273,6 +273,26 @@ func run(ctx context.Context, argv []string) error {
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)
+	}
+}
+
+// parseArgs parses fs's flags wherever they appear among the positional
+// arguments, and returns the positionals. The flag package stops at the first
+// non-flag, so `pull-release <ref> -j 8` would otherwise leave "-j 8" as two
+// more positionals. A literal "--" still ends flag parsing.
+func parseArgs(fs *flag.FlagSet, args []string) []string {
+	var pos []string
+	for {
+		_ = fs.Parse(args) // ExitOnError: a bad flag exits here
+		rest := fs.Args()
+		if len(rest) == 0 {
+			return pos
+		}
+		if consumed := len(args) - len(rest); consumed > 0 && args[consumed-1] == "--" {
+			return append(pos, rest...)
+		}
+		pos = append(pos, rest[0])
+		args = rest[1:]
 	}
 }
 
@@ -416,8 +436,10 @@ COMMANDS:
   pull <ref>…        warm a cache with EVERY platform of an image (multi-arch),
                      so export/import carries all arches (nvcr.io: needs an NGC
                      key in ~/.ngc or --creds '$oauthtoken:<key>')
-  pull-release <ref> warm the caches with an OKD/OpenShift release and every
-                     payload image it lists (--platform linux/amd64, -j 4);
+  pull-release <ref> [-j 4] [--platform linux/amd64]
+                     warm the caches with an OKD/OpenShift release and every
+                     payload image it lists, then verify it is on disk
+                     (re-warming what is not); flags go before or after <ref>.
                      list --okd-release <ref> reports how much is cached
   export [-o f.tgz]  bundle every cache's data into one .tgz to copy elsewhere
   import <f.tgz>     unpack a bundle into this host's cache volumes (seeds offline)

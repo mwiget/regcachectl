@@ -115,6 +115,10 @@ type Engine struct {
 	// pull-release (tests observe how bodies are consumed through it).
 	transport http.RoundTripper
 
+	// storeFor, when set, replaces reading a cache's on-disk store from its
+	// container (tests).
+	storeFor func(ctx context.Context, u Upstream) (storeView, error)
+
 	// ProxyTTL is the registry proxy's content expiry (proxy.ttl); 0 never
 	// expires. Only distribution v3 honours it — registry:2.8 ignores the
 	// variable and keeps its fixed 7 days.

@@ -191,6 +191,16 @@ process a Range: header)`); warmed first, every node pull is a hit. For
 cache from quay.io with `-j 8` took 2m7s and stored 17.2 GB; re-running it
 against the warm cache with the upstream unreachable took 2 s.
 
+`pull-release` then checks what the cache actually stored, the same on-disk check
+`list --okd-release` makes, and re-warms what is missing (up to two rounds); its
+final count is that verified count. A `200` is not enough: while another client's
+fetch of the same blob is in flight, the proxy streams it straight from the
+upstream without storing it, and if that other client hangs up the blob is
+stored by nobody. Against a throwaway registry:3, with three slow clients hanging
+up mid-fetch, a pass that reported 191/191 left 3 images incomplete on disk; the
+re-warm made them 191/191 verified. Flags may go before or after the release
+ref (`pull-release <ref> -j 8`).
+
 `list --okd-release` answers from the cache's on-disk store without fetching
 anything; add `--objects` to list the payload images still missing.
 

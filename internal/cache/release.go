@@ -71,25 +71,121 @@ func (e *Engine) PullRelease(ctx context.Context, ref, platform string, jobs int
 	e.logf("release lists %d payload images; warming %s with -j %d ...", len(refs), platformLabel(platform), jobs)
 
 	results := e.warmAll(ctx, refs, platform, jobs, creds, seen)
-	var failed []string
+	warmErr := map[string]error{}
 	var blobs int
 	for _, r := range results {
 		if r.err != nil {
-			failed = append(failed, fmt.Sprintf("%s: %v", r.ref, r.err))
+			warmErr[r.ref] = r.err
 			continue
 		}
 		blobs += r.stats.blobs
 	}
-	e.logf("done: %d/%d payload images warmed (%d blob references, %d blobs fetched) in %s",
-		len(refs)-len(failed), len(refs), blobs, countSeen(seen), time.Since(start).Round(time.Second))
-	if len(failed) > 0 {
-		sort.Strings(failed)
-		for _, f := range failed {
-			e.logf("  ✗ %s", f)
+	e.logf("warmed %d/%d payload images (%d blob references, %d blobs fetched) in %s",
+		len(refs)-len(warmErr), len(refs), blobs, countSeen(seen), time.Since(start).Round(time.Second))
+
+	// A 200 for every blob does not mean the cache kept it: the registry
+	// proxy streams a blob another client is already fetching straight from
+	// the upstream without storing it, and when that other client hangs up the
+	// blob is stored by nobody. So count what is on disk, the way `list
+	// --okd-release` does, and re-warm what is missing.
+	all := append([]string{ref}, refs...)
+	missing, verr := e.missingOnDisk(ctx, all, platform)
+	for round := 1; verr == nil && len(missing) > 0 && round <= verifyRounds; round++ {
+		e.logf("%d image(s) not fully on disk after warming; re-warming them (round %d/%d) ...", len(missing), round, verifyRounds)
+		time.Sleep(reWarmPause)
+		for _, r := range e.warmAll(ctx, missing, platform, jobs, creds, &sync.Map{}) {
+			if r.err != nil {
+				warmErr[r.ref] = r.err
+			} else {
+				delete(warmErr, r.ref)
+			}
 		}
-		return fmt.Errorf("pull-release: %d of %d payload images failed", len(failed), len(refs))
+		missing, verr = e.missingOnDisk(ctx, all, platform)
 	}
-	return nil
+	if verr != nil {
+		// cannot read the store (no runtime, another registry on this port):
+		// report what the warm itself saw, and say it is unverified.
+		e.logf("done (NOT verified on disk: %v)", verr)
+		return e.reportFailures(warmErr, len(refs), "failed")
+	}
+	notOnDisk := map[string]error{}
+	for _, m := range missing {
+		err := warmErr[m]
+		if err == nil {
+			err = fmt.Errorf("served, but not stored by the cache")
+		}
+		notOnDisk[m] = err
+	}
+	payloadMissing := len(missing)
+	if _, releaseMissing := notOnDisk[ref]; releaseMissing {
+		payloadMissing--
+	}
+	e.logf("done: %d/%d payload images verified on disk in %s", len(refs)-payloadMissing, len(refs), time.Since(start).Round(time.Second))
+	return e.reportFailures(notOnDisk, len(refs), "not on disk")
+}
+
+// verifyRounds is how often pull-release re-warms images it found missing
+// from the on-disk store before reporting them.
+const verifyRounds = 2
+
+// reWarmPause lets the fetch that left a blob unstored end first: while
+// another client's fetch of it is in flight, the proxy keeps serving it
+// without storing it. (Against a throwaway registry:3, one of three such
+// images still needed the second round without a pause.)
+var reWarmPause = 2 * time.Second
+
+func (e *Engine) reportFailures(failed map[string]error, total int, what string) error {
+	if len(failed) == 0 {
+		return nil
+	}
+	var lines []string
+	for r, err := range failed {
+		lines = append(lines, fmt.Sprintf("%s: %v", r, err))
+	}
+	sort.Strings(lines)
+	for _, l := range lines {
+		e.logf("  ✗ %s", l)
+	}
+	return fmt.Errorf("pull-release: %d of %d payload images %s", len(failed), total, what)
+}
+
+// missingOnDisk returns the refs whose image is not completely in its cache's
+// on-disk store (manifest, wanted platforms, every config and layer linked
+// into the repository) — the check `list --okd-release` makes.
+func (e *Engine) missingOnDisk(ctx context.Context, refs []string, platform string) ([]string, error) {
+	views := map[string]storeView{}
+	var missing []string
+	for _, r := range refs {
+		pr, err := parseRef(r)
+		if err != nil {
+			missing = append(missing, r)
+			continue
+		}
+		idx, ok := upstreamIndexForHost(pr.host)
+		if !ok || Upstreams[idx].Blobcache {
+			missing = append(missing, r)
+			continue
+		}
+		u := Upstreams[idx]
+		v, ok := views[u.Name]
+		if !ok {
+			if v, err = e.openStore(ctx, u); err != nil {
+				return nil, err
+			}
+			views[u.Name] = v
+		}
+		digest := pr.ref
+		if !strings.HasPrefix(digest, "sha256:") {
+			if digest, ok = v.tagDigest(pr.repo, pr.ref); !ok {
+				missing = append(missing, r)
+				continue
+			}
+		}
+		if full, _ := imageOnDisk(v, pr.repo, digest, platform); !full {
+			missing = append(missing, r)
+		}
+	}
+	return missing, nil
 }
 
 func platformLabel(p string) string {
