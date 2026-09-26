@@ -176,7 +176,7 @@ func TestDiskView(t *testing.T) {
 	t.Setenv("FAKE_LAYERS", write("layers", h('a')+"\n"+h('d')+"\n")) // d linked, no data
 	t.Setenv("FAKE_REVS", write("revs", h('c')+"\n"+h('e')+"\n"))     // e: revision, no data
 
-	v := &diskView{e: e, ctx: context.Background(), u: quayUpstream(), revs: map[string]map[string]bool{}, layers: map[string]map[string]bool{}}
+	v := &diskView{e: e, ctx: context.Background(), u: quayUpstream(), name: "regcache-quay", revs: map[string]map[string]bool{}, layers: map[string]map[string]bool{}}
 	if err := v.loadBlobs(); err != nil {
 		t.Fatal(err)
 	}
@@ -196,5 +196,21 @@ func TestDiskView(t *testing.T) {
 		if c.got != c.want {
 			t.Errorf("%s: %v, want %v", c.name, c.got, c.want)
 		}
+	}
+}
+
+// The disk read must describe the registry being addressed: with an explicit
+// --port-base pointing elsewhere, the fleet container is another store.
+func TestOpenStore_RefusesAnotherRegistrysPort(t *testing.T) {
+	e, _, _ := fakeRuntime(t)
+	u := Upstreams[0] // dockerhub: running in the fake runtime
+	e.ports = map[string]int{u.Name: 5100}
+	e.PortBase, e.PortBaseSet = 5000, true
+	if _, err := e.openStore(context.Background(), u); err == nil || !strings.Contains(err.Error(), "publishes :5100") {
+		t.Errorf("openStore on a port the container does not publish: err = %v", err)
+	}
+	e.PortBaseSet = false // discovered port addressed: fine
+	if _, err := e.openStore(context.Background(), u); err != nil {
+		t.Errorf("openStore on the container's own port: %v", err)
 	}
 }

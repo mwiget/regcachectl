@@ -32,6 +32,8 @@ type fakeRegistry struct {
 
 	mu        sync.Mutex
 	gets      map[string]int
+	stored    map[string]bool // "repo@digest": blobs the cache kept (and linked)
+	lose      map[string]int  // digest → how many more GETs are served but not kept
 	inflight  int32
 	maxFlight int32
 	truncated []string // blobs a client closed before reading to the end
@@ -43,7 +45,8 @@ type fakeManifest struct {
 }
 
 func newFakeRegistry() *fakeRegistry {
-	return &fakeRegistry{manifests: map[string]fakeManifest{}, blobs: map[string][]byte{}, gets: map[string]int{}}
+	return &fakeRegistry{manifests: map[string]fakeManifest{}, blobs: map[string][]byte{}, gets: map[string]int{},
+		stored: map[string]bool{}, lose: map[string]int{}}
 }
 
 func digestOf(b []byte) string { return fmt.Sprintf("sha256:%x", sha256.Sum256(b)) }
@@ -141,6 +144,15 @@ func (f *fakeRegistry) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			w.(http.Flusher).Flush()
 		}
+		// like the registry proxy: a blob served while another client's fetch
+		// of it fails is streamed to this client but stored by nobody.
+		f.mu.Lock()
+		if f.lose[d] > 0 {
+			f.lose[d]--
+		} else {
+			f.stored[p[:i]+"@"+d] = true
+		}
+		f.mu.Unlock()
 		return
 	}
 	http.NotFound(w, r)
@@ -149,12 +161,36 @@ func (f *fakeRegistry) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // serveAsQuay starts f and returns an Engine whose quay cache port is f's.
 func serveAsQuay(t *testing.T, f *fakeRegistry) *Engine {
 	t.Helper()
+	reWarmPause = 0
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
 	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
 	port, _ := strconv.Atoi(portStr)
 	idx, _ := upstreamIndexForHost("quay.io")
-	return &Engine{PortBase: port - idx, Out: io.Discard, transport: &eofTracker{f: f}}
+	return &Engine{PortBase: port - idx, Out: io.Discard, transport: &eofTracker{f: f},
+		storeFor: func(context.Context, Upstream) (storeView, error) { return &servedStore{f}, nil }}
+}
+
+// servedStore is the on-disk view of a fakeRegistry: every manifest, and the
+// blobs it actually kept.
+type servedStore struct{ f *fakeRegistry }
+
+func (s *servedStore) hasManifest(repo, d string) bool {
+	_, ok := s.f.manifests[repo+"@"+d]
+	return ok
+}
+func (s *servedStore) hasBlob(repo, d string) bool {
+	s.f.mu.Lock()
+	defer s.f.mu.Unlock()
+	return s.f.stored[repo+"@"+d]
+}
+func (s *servedStore) tagDigest(repo, tag string) (string, bool) { return "", false }
+func (s *servedStore) readManifest(repo, d string) ([]byte, string, error) {
+	m := s.f.manifests[repo+"@"+d]
+	return m.body, m.ctype, nil
+}
+func (s *servedStore) openBlob(repo, d string) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(s.f.blobs[d])), nil
 }
 
 // eofTracker records, client side, each blob body closed before its end was
@@ -339,8 +375,8 @@ func TestPullRelease_ReportsFailuresAndWarmsTheRest(t *testing.T) {
 	delete(f.manifests, "okd/content@"+gone)
 	e := serveAsQuay(t, f)
 	err := e.PullRelease(context.Background(), r.ref, "linux/amd64", 3, "")
-	if err == nil || !strings.Contains(err.Error(), "1 of 6 payload images failed") {
-		t.Fatalf("err = %v, want 1 of 6 failed", err)
+	if err == nil || !strings.Contains(err.Error(), "1 of 6 payload images not on disk") {
+		t.Fatalf("err = %v, want 1 of 6 not on disk", err)
 	}
 	for i, p := range r.payload {
 		d := p[strings.Index(p, "@")+1:]
@@ -433,12 +469,85 @@ func TestPullRelease_SharedBlobWarmedPerRepository(t *testing.T) {
 	top := tarGz(t, map[string][]byte{imageReferencesPath: imageStream("quay.io/okd/content@"+a, "quay.io/okd/other@"+b)})
 	rel := f.addImage("okd/release", top)
 	e := serveAsQuay(t, f)
+	var out bytes.Buffer
+	e.Out = &out
 	if err := e.PullRelease(context.Background(), "quay.io/okd/release@"+rel, "", 2, ""); err != nil {
 		t.Fatal(err)
+	}
+	// in the first pass: the on-disk re-warm must not be what stores it.
+	if strings.Contains(out.String(), "re-warming") {
+		t.Errorf("the first pass left the shared layer unwarmed in one repository:\n%s", out.String())
 	}
 	for _, repo := range []string{"okd/content", "okd/other"} {
 		if n := f.count("/v2/" + repo + "/blobs/" + digestOf(base)); n != 1 {
 			t.Errorf("shared layer fetched %d times through %s, want 1", n, repo)
 		}
+	}
+}
+
+// A blob the cache served but did not keep is found by the on-disk check and
+// warmed again; the run succeeds only once it is stored.
+func TestPullRelease_ReWarmsWhatTheCacheDidNotKeep(t *testing.T) {
+	f := newFakeRegistry()
+	r := buildRelease(t, f, 6)
+	f.lose[r.shared] = 1
+	e := serveAsQuay(t, f)
+	var out bytes.Buffer
+	e.Out = &out
+	if err := e.PullRelease(context.Background(), r.ref, "linux/amd64", 3, ""); err != nil {
+		t.Fatalf("%v\n%s", err, out.String())
+	}
+	if !f.stored["okd/content@"+r.shared] {
+		t.Error("the lost shared layer is still not stored")
+	}
+	if n := f.count("/v2/okd/content/blobs/" + r.shared); n != 2 {
+		t.Errorf("lost layer fetched %d times, want 2 (warm + re-warm)", n)
+	}
+	if !strings.Contains(out.String(), "re-warming") || !strings.Contains(out.String(), "done: 7/7 payload images verified on disk") {
+		t.Errorf("output does not show the re-warm and the verified count:\n%s", out.String())
+	}
+}
+
+// A blob the cache never keeps is reported, however many 200s it served.
+func TestPullRelease_ReportsWhatNeverGetsStored(t *testing.T) {
+	f := newFakeRegistry()
+	r := buildRelease(t, f, 3)
+	var m struct {
+		Layers []struct{ Digest string } `json:"layers"`
+	}
+	json.Unmarshal(f.manifests["okd/content@"+r.payload[1][strings.Index(r.payload[1], "@")+1:]].body, &m)
+	f.lose[m.Layers[1].Digest] = 1000
+	e := serveAsQuay(t, f)
+	var out bytes.Buffer
+	e.Out = &out
+	err := e.PullRelease(context.Background(), r.ref, "linux/amd64", 2, "")
+	if err == nil || !strings.Contains(err.Error(), "1 of 4 payload images not on disk") {
+		t.Fatalf("err = %v, want 1 of 4 not on disk\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "done: 3/4 payload images verified on disk") ||
+		!strings.Contains(out.String(), r.payload[1]+": served, but not stored by the cache") {
+		t.Errorf("output does not name the unstored image honestly:\n%s", out.String())
+	}
+}
+
+// Without access to the store the result is reported as unverified, not as
+// verified.
+func TestPullRelease_SaysWhenItCannotVerify(t *testing.T) {
+	f := newFakeRegistry()
+	r := buildRelease(t, f, 2)
+	e := serveAsQuay(t, f)
+	e.storeFor = func(context.Context, Upstream) (storeView, error) { return nil, fmt.Errorf("no runtime") }
+	var out bytes.Buffer
+	e.Out = &out
+	if err := e.PullRelease(context.Background(), r.ref, "", 2, ""); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "NOT verified on disk: no runtime") || strings.Contains(out.String(), "verified on disk in") {
+		t.Errorf("unverifiable run not reported as such:\n%s", out.String())
+	}
+	// unverified, a warm failure is still reported.
+	delete(f.manifests, "okd/content@"+r.payload[0][strings.Index(r.payload[0], "@")+1:])
+	if err := e.PullRelease(context.Background(), r.ref, "", 2, ""); err == nil || !strings.Contains(err.Error(), "1 of 3 payload images failed") {
+		t.Errorf("unverified run with a failed image: err = %v", err)
 	}
 }

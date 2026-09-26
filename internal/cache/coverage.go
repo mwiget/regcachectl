@@ -44,16 +44,35 @@ func (e *Engine) ReleaseCoverage(ctx context.Context, ref, platform string) (Rel
 		return ReleaseCoverage{}, fmt.Errorf("no registry cache for host %q", rf.host)
 	}
 	u := Upstreams[idx]
-	if _, running, err := e.containerState(ctx, container(u)); err != nil {
-		return ReleaseCoverage{}, err
-	} else if !running {
-		return ReleaseCoverage{}, fmt.Errorf("cache %s is not running", u.Name)
-	}
-	v := &diskView{e: e, ctx: ctx, u: u, port: e.Port(idx), revs: map[string]map[string]bool{}, layers: map[string]map[string]bool{}}
-	if err := v.loadBlobs(); err != nil {
+	v, err := e.openStore(ctx, u)
+	if err != nil {
 		return ReleaseCoverage{}, err
 	}
 	return releaseCoverage(v, u, rf, platform)
+}
+
+// openStore gives read access to what the cache for u holds on disk: its
+// running container, read by exec. It refuses when that container does not
+// publish the port this engine addresses (an explicit --port-base pointing at
+// another registry), since the disk read would describe a different store.
+func (e *Engine) openStore(ctx context.Context, u Upstream) (storeView, error) {
+	if e.storeFor != nil {
+		return e.storeFor(ctx, u)
+	}
+	if _, running, err := e.containerState(ctx, container(u)); err != nil {
+		return nil, err
+	} else if !running {
+		return nil, fmt.Errorf("cache %s is not running", u.Name)
+	}
+	idx := indexOf(u)
+	if p, ok := e.ports[u.Name]; ok && p > 0 && p != e.Port(idx) {
+		return nil, fmt.Errorf("%s publishes :%d, not the :%d addressed here", container(u), p, e.Port(idx))
+	}
+	v := &diskView{e: e, ctx: ctx, u: u, name: container(u), revs: map[string]map[string]bool{}, layers: map[string]map[string]bool{}}
+	if err := v.loadBlobs(); err != nil {
+		return nil, err
+	}
+	return v, nil
 }
 
 func releaseCoverage(v storeView, u Upstream, rf imageRef, platform string) (ReleaseCoverage, error) {
@@ -223,7 +242,7 @@ type diskView struct {
 	e      *Engine
 	ctx    context.Context
 	u      Upstream
-	port   int
+	name   string // the cache container read by exec
 	blobs  map[string]bool
 	revs   map[string]map[string]bool // repo → manifest digests with a revision link
 	layers map[string]map[string]bool // repo → blob digests linked into it
@@ -232,7 +251,7 @@ type diskView struct {
 const registryRoot = "/var/lib/registry/docker/registry/v2"
 
 func (v *diskView) loadBlobs() error {
-	out, err := v.e.run(v.ctx, "exec", container(v.u), "find", registryRoot+"/blobs", "-name", "data", "-type", "f")
+	out, err := v.e.run(v.ctx, "exec", v.name, "find", registryRoot+"/blobs", "-name", "data", "-type", "f")
 	if err != nil {
 		return fmt.Errorf("list %s blobs: %w", v.u.Name, err)
 	}
@@ -261,7 +280,7 @@ func (v *diskView) links(cache map[string]map[string]bool, repo, sub string) map
 	if l, ok := cache[repo]; ok {
 		return l
 	}
-	out, _ := v.e.run(v.ctx, "exec", container(v.u), "ls", "-1", registryRoot+"/repositories/"+repo+"/"+sub)
+	out, _ := v.e.run(v.ctx, "exec", v.name, "ls", "-1", registryRoot+"/repositories/"+repo+"/"+sub)
 	l := map[string]bool{}
 	for _, h := range strings.Fields(out) {
 		l["sha256:"+h] = true
@@ -271,7 +290,7 @@ func (v *diskView) links(cache map[string]map[string]bool, repo, sub string) map
 }
 
 func (v *diskView) tagDigest(repo, tag string) (string, bool) {
-	out, err := v.e.run(v.ctx, "exec", container(v.u), "cat", registryRoot+"/repositories/"+repo+"/_manifests/tags/"+tag+"/current/link")
+	out, err := v.e.run(v.ctx, "exec", v.name, "cat", registryRoot+"/repositories/"+repo+"/_manifests/tags/"+tag+"/current/link")
 	if err != nil || !strings.HasPrefix(out, "sha256:") {
 		return "", false
 	}
