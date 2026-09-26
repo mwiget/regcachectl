@@ -15,10 +15,10 @@ type Listing struct {
 	Name    string
 	Host    string
 	Port    int
-	Engine  string // "registry:2" or "blobcache"
-	State   string // running / stopped / absent
-	Size    string // human-readable total ("-" if unknown)
-	Bytes   int64  // total bytes (0 if unknown)
+	Engine  string   // "registry:2" or "blobcache"
+	State   string   // running / stopped / absent
+	Size    string   // human-readable total ("-" if unknown)
+	Bytes   int64    // total bytes (0 if unknown)
 	Objects []Object // image-level view (repo:tag, or repo name for F5 blobs)
 	Blobs   []Object // F5 blob cache only: digest-level layer detail
 	Note    string   // shared-store caveat etc.

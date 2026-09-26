@@ -9,6 +9,7 @@ import (
 	neturl "net/url"
 	"os"
 	"strings"
+	"sync"
 )
 
 // Pull warms the pull-through cache for each ref with EVERY platform of the
@@ -117,52 +118,113 @@ func (e *Engine) pullOne(ctx context.Context, raw, creds string) error {
 	pc := &pullClient{hc: &http.Client{}, base: fmt.Sprintf("http://localhost:%d", port), repo: rf.repo, creds: creds}
 
 	e.logf("warming %s/%s:%s (all platforms) via :%d ...", rf.host, rf.repo, rf.ref, port)
-	body, ctype, err := pc.getManifest(ctx, rf.ref)
+	st, err := pc.warmImage(ctx, rf.ref, "", func(plat, digest string, n int) {
+		e.logf("  • %-18s %s (%d blobs)", plat, ShortDigest(digest), n)
+	})
 	if err != nil {
 		return err
 	}
+	e.logf("done: %s/%s — %d manifest(s), %d blobs cached on :%d", rf.host, rf.repo, st.manifests, st.blobs, port)
+	return nil
+}
 
-	var manifests, blobs int
-	if isIndex(ctype) {
-		var ix struct {
-			Manifests []struct {
-				Digest   string `json:"digest"`
-				Platform struct {
-					OS   string `json:"os"`
-					Arch string `json:"architecture"`
-				} `json:"platform"`
-			} `json:"manifests"`
-		}
-		if err := json.Unmarshal(body, &ix); err != nil {
-			return fmt.Errorf("parse manifest index: %w", err)
-		}
-		for _, m := range ix.Manifests {
-			child, _, err := pc.getManifest(ctx, m.Digest)
-			if err != nil {
-				return err
-			}
-			n, err := pc.warmManifestBlobs(ctx, child)
-			if err != nil {
-				return err
-			}
-			plat := strings.TrimPrefix(m.Platform.OS+"/"+m.Platform.Arch, "/")
-			if plat == "" || plat == "unknown/unknown" {
-				plat = "attestation"
-			}
-			e.logf("  • %-18s %s (%d blobs)", plat, ShortDigest(m.Digest), n)
-			manifests++
-			blobs += n
-		}
-	} else {
+// warmStats counts what one warmImage walked.
+type warmStats struct{ manifests, blobs int }
+
+// warmImage fetches ref's manifest and, for an index, every child manifest
+// whose platform matches (all when platform is empty), then each manifest's
+// config and layers — the full pull, through the cache, so the cache keeps it.
+// each, when set, is told about every manifest warmed ("single" for an image
+// that is not an index).
+func (pc *pullClient) warmImage(ctx context.Context, ref, platform string, each func(plat, digest string, blobs int)) (warmStats, error) {
+	var st warmStats
+	body, ctype, err := pc.getManifest(ctx, ref)
+	if err != nil {
+		return st, err
+	}
+	if !isIndex(ctype) {
 		n, err := pc.warmManifestBlobs(ctx, body)
 		if err != nil {
-			return err
+			return st, err
 		}
-		e.logf("  • single-platform manifest (%d blobs)", n)
-		manifests, blobs = 1, n
+		if each != nil {
+			each("single-platform", ref, n)
+		}
+		return warmStats{1, n}, nil
 	}
-	e.logf("done: %s/%s — %d manifest(s), %d blobs cached on :%d", rf.host, rf.repo, manifests, blobs, port)
-	return nil
+	ix, err := parseIndex(body)
+	if err != nil {
+		return st, err
+	}
+	for _, m := range ix {
+		if !platformMatches(platform, m.plat) {
+			continue
+		}
+		child, _, err := pc.getManifest(ctx, m.digest)
+		if err != nil {
+			return st, err
+		}
+		n, err := pc.warmManifestBlobs(ctx, child)
+		if err != nil {
+			return st, err
+		}
+		if each != nil {
+			each(m.plat, m.digest, n)
+		}
+		st.manifests++
+		st.blobs += n
+	}
+	if st.manifests == 0 && platform != "" {
+		return st, fmt.Errorf("%s has no manifest for platform %s", ref, platform)
+	}
+	return st, nil
+}
+
+// indexEntry is one child of a manifest index.
+type indexEntry struct {
+	digest string
+	plat   string // os/arch[/variant]; "attestation" for unknown/unknown
+}
+
+func parseIndex(body []byte) ([]indexEntry, error) {
+	var ix struct {
+		Manifests []struct {
+			Digest   string `json:"digest"`
+			Platform struct {
+				OS      string `json:"os"`
+				Arch    string `json:"architecture"`
+				Variant string `json:"variant"`
+			} `json:"platform"`
+		} `json:"manifests"`
+	}
+	if err := json.Unmarshal(body, &ix); err != nil {
+		return nil, fmt.Errorf("parse manifest index: %w", err)
+	}
+	out := make([]indexEntry, 0, len(ix.Manifests))
+	for _, m := range ix.Manifests {
+		plat := strings.TrimPrefix(m.Platform.OS+"/"+m.Platform.Arch, "/")
+		if m.Platform.Variant != "" {
+			plat += "/" + m.Platform.Variant
+		}
+		if plat == "" || plat == "unknown/unknown" {
+			plat = "attestation"
+		}
+		out = append(out, indexEntry{digest: m.Digest, plat: plat})
+	}
+	return out, nil
+}
+
+// platformMatches reports whether an index child's platform is wanted. An
+// empty want takes every child (attestations included). A want without a
+// variant (linux/arm64) accepts any variant of it; with one it must match.
+func platformMatches(want, plat string) bool {
+	if want == "" {
+		return true
+	}
+	if plat == want {
+		return true
+	}
+	return strings.Count(want, "/") == 1 && strings.HasPrefix(plat, want+"/")
 }
 
 // --- minimal registry-v2 client (stdlib only, mirrors list.go's httpJSON) ---
@@ -188,6 +250,10 @@ type pullClient struct {
 	repo  string
 	creds string // "user:password" or ""
 	token string // cached bearer, minted on the first 401
+	// seen, when set, is shared between clients warming many images of one
+	// cache: a blob is fetched by the first to reach it and skipped by the
+	// rest, so concurrent warmers never pull the same cold blob at once.
+	seen *sync.Map
 }
 
 // getManifest GETs repo/manifests/<ref>, doing the bearer token dance on a 401.
@@ -209,7 +275,7 @@ func (pc *pullClient) getManifest(ctx context.Context, ref string) (body []byte,
 		}
 	}
 	if status != http.StatusOK {
-		return nil, "", fmt.Errorf("GET manifest %s: HTTP %d: %s", ref, status, strings.TrimSpace(string(b)))
+		return nil, "", fmt.Errorf("GET manifest %s: HTTP %d: %s", ref, status, clip(strings.TrimSpace(string(b)), 200))
 	}
 	return b, ct, nil
 }
@@ -236,7 +302,15 @@ func (pc *pullClient) warmManifestBlobs(ctx context.Context, manifest []byte) (i
 		}
 	}
 	for _, d := range digs {
+		if pc.seen != nil {
+			if _, dup := pc.seen.LoadOrStore(d, true); dup {
+				continue
+			}
+		}
 		if err := pc.warmBlob(ctx, d); err != nil {
+			if pc.seen != nil {
+				pc.seen.Delete(d) // let a later reference retry it
+			}
 			return 0, err
 		}
 	}
@@ -372,6 +446,14 @@ func parseChallenge(s string) map[string]string {
 	}
 	flush()
 	return m
+}
+
+// clip shortens an upstream error body for a one-line message.
+func clip(s string, n int) string {
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
 }
 
 func readNGCKey() string {
