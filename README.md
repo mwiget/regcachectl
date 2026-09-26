@@ -71,7 +71,11 @@ regcachectl export -o regcache.tgz              # bundle every cache into one .t
 regcachectl export -o nvcr.tgz --cache nvcr     # bundle only one cache (e.g. just the warmed nvcr image)
 regcachectl import regcache.tgz                 # unpack a bundle into this host's cache volumes (offline seed)
 regcachectl print-registries > registries.yaml  # the k3s wiring snippet
-regcachectl gc                                   # reclaim space in the public caches
+regcachectl print-registries --format crio --host 10.240.0.2 > registries.conf   # CRI-O / podman
+regcachectl print-registries --format okd --host 10.240.0.2 > regcache.yaml      # OKD IDMS/ITMS/Image
+regcachectl pull-release quay.io/okd/scos-release@sha256:…  # warm an OKD release + its whole payload
+regcachectl list --okd-release quay.io/okd/scos-release@sha256:…  # "N/M payload images cached"
+regcachectl gc                                   # reclaim orphaned blobs (keeps digest-pulled images)
 regcachectl down                                 # stop & remove (keeps cached blobs)
 regcachectl down --purge                         # also drop the cached blobs
 ```
@@ -154,6 +158,64 @@ Mount it into each k3s node at `/etc/rancher/k3s/registries.yaml` and give the
 node containers `--add-host host.docker.internal:host-gateway` so they can reach
 the host-published caches. (In tmmlitectl this is the opt-in `cluster.registry_cache`
 poc.yaml knob — see that repo. For manual use, pass `--host <bridge-gateway-ip>`.)
+
+### Wiring CRI-O and OKD nodes
+
+`--format crio` emits a `containers-registries.conf(5)` with one `[[registry]]`
+per cache and the cache as an insecure (plain-HTTP) `[[registry.mirror]]`; CRI-O
+falls back to the upstream itself when the cache is down, so `--no-fallback` is
+refused for this format. `--format okd` emits an `ImageDigestMirrorSet`, an
+`ImageTagMirrorSet` and the `cluster` `Image` with the caches in
+`spec.registrySources.insecureRegistries`; `--no-fallback` there sets
+`mirrorSourcePolicy: NeverContactSource`. Both use `--host` (the address the
+nodes reach the host at) and the same port-by-index layout as the k3s output.
+Applying the `Image` replaces its spec — merge it into an existing one on a
+running cluster.
+
+### Warming an OKD release (`pull-release`)
+
+```bash
+regcachectl pull-release -j 8 quay.io/okd/scos-release@sha256:65f272bc…   # 4.22.0-okd-scos.10
+regcachectl list --okd-release quay.io/okd/scos-release@sha256:65f272bc…
+regcachectl export --cache quay -o okd-4.22.tgz                           # an offline OKD
+```
+
+`pull-release` reads `release-manifests/image-references` from the release
+image (top layer first), then pulls every payload image it names through its
+cache, `-j` at a time, with each shared layer fetched once. `--platform`
+(default `linux/amd64`) picks the child of multi-arch images; `--platform ''`
+warms all. A cold cache serving one uncached blob to several nodes at once is
+where installs failed (`unexpected EOF (after reconnecting, server did not
+process a Range: header)`); warmed first, every node pull is a hit. For
+4.22.0-okd-scos.10 (191 payload images, 458 distinct blobs) a warm of an empty
+cache from quay.io with `-j 8` took 2m7s and stored 17.2 GB; re-running it
+against the warm cache with the upstream unreachable took 2 s.
+
+`list --okd-release` answers from the cache's on-disk store without fetching
+anything; add `--objects` to list the payload images still missing.
+
+### Cache lifetime and `gc`
+
+The registry caches run `registry:3.1.2` (distribution v3). `registry:2.8`'s
+proxy deletes every blob and manifest a fixed 7 days after it first fetched it,
+whether or not it was used since — a warmed OKD payload or an imported air-gap
+bundle expires a week later. v3 makes that `proxy.ttl` configurable; `up
+--proxy-ttl` sets it and defaults to `0`, keep until `gc`/`down --purge`. Tags
+are still re-resolved upstream on every pull, so a moved tag is followed.
+v3 reads the same on-disk layout: an existing 2.8.3 volume serves unchanged, and
+a v3-written volume serves under 2.8.3 again. `up` never recreates a running
+cache; it says when one runs another image, and `regcachectl down && regcachectl
+up` switches it with the cached data kept.
+
+`gc` stops each registry cache, runs `registry garbage-collect` against its
+volume in a throwaway container of the same image, and starts it again. Running
+it against the serving registry is unsafe: the running process keeps a stale
+in-memory record of every blob it deletes and answers `200` with the full
+`Content-Length` and an empty body until restarted. By default it only removes
+blobs no cached manifest references. `gc --delete-untagged` also deletes every
+manifest no tag points at — in a pull-through cache that is everything pulled by
+digest: on a cache holding OKD 4.22 it would delete 658 of 707 blobs. (`registry:2.8`
+refuses `--delete-untagged` outright when a repository holds no tag.)
 
 ### Moving the cache to another host
 

@@ -17,15 +17,35 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // RegistryImage is the pull-through cache image for the public, anonymous
-// upstreams. registry:2 is the CNCF distribution registry; in proxy mode
-// (REGISTRY_PROXY_REMOTEURL) it is a transparent caching mirror.
-const RegistryImage = "registry:2.8.3"
+// upstreams: the CNCF distribution registry, which in proxy mode
+// (REGISTRY_PROXY_REMOTEURL) is a transparent caching mirror.
+//
+// distribution v3 rather than registry:2.8.3, because 2.8's proxy deletes every
+// blob and manifest it cached a fixed 7 days after first fetching it (a
+// hard-coded repositoryTTL, not refreshed by HITs), so a warmed OKD payload or
+// an imported air-gap bundle silently expires. v3 makes that TTL configurable
+// (proxy.ttl, 0 disables it) and reads the same on-disk layout, so an existing
+// 2.8.3 volume serves unchanged (and back again, if rolled back).
+const RegistryImage = "registry:3.1.2"
+
+// DefaultProxyTTL is how long a registry proxy keeps content it fetched: 0
+// keeps it until `gc --delete-untagged` or `down --purge`. Tags are still
+// re-resolved against the upstream on every pull, so a moved tag is followed.
+const DefaultProxyTTL time.Duration = 0
+
+// cacheWriteTimeout bounds how long distribution v3 may take to store one
+// blob it is proxying (its own default is 5m, which a multi-GB layer over a
+// slow upstream exceeds, leaving the blob served but never cached).
+const cacheWriteTimeout = "1h"
 
 // BlobcacheImage runs regcachectl's own credential-free, redirect-following
 // blob cache (cmd `serve-blobcache`) for the private GAR-backed upstream. The
@@ -90,6 +110,15 @@ type Engine struct {
 	// ports maps an upstream name to the host port its container publishes,
 	// filled by DiscoverPorts. Empty until then (and for absent caches).
 	ports map[string]int
+
+	// transport, when set, carries the registry HTTP requests of pull and
+	// pull-release (tests observe how bodies are consumed through it).
+	transport http.RoundTripper
+
+	// ProxyTTL is the registry proxy's content expiry (proxy.ttl); 0 never
+	// expires. Only distribution v3 honours it — registry:2.8 ignores the
+	// variable and keeps its fixed 7 days.
+	ProxyTTL time.Duration
 }
 
 // ImageName is the effective registry image (override or default).
@@ -245,6 +274,9 @@ func (e *Engine) Up(ctx context.Context) error {
 			} else {
 				e.logf("  = %-9s running   %s → :%d", u.Name, u.Host, port)
 			}
+			if !u.Blobcache {
+				e.noteImageDrift(ctx, u)
+			}
 			continue
 		}
 		if _, err := e.run(ctx, e.runArgs(u, port)...); err != nil {
@@ -281,13 +313,34 @@ func (e *Engine) runArgs(u Upstream, port int) []string {
 			"--listen", ":5000", "--cache-dir", "/var/lib/blobcache",
 		)
 	}
-	// anonymous registry:2 pull-through cache.
+	// anonymous registry pull-through cache.
 	return append(base,
 		"-v", volume(u)+":/var/lib/registry",
 		"-e", "REGISTRY_PROXY_REMOTEURL="+u.Remote,
+		"-e", "REGISTRY_PROXY_TTL="+e.ProxyTTL.String(),
+		"-e", "REGISTRY_PROXY_CACHEWRITETIMEOUT="+cacheWriteTimeout,
 		"-e", "REGISTRY_STORAGE_DELETE_ENABLED=true",
+		// the v3 image's bundled config logs at debug.
+		"-e", "REGISTRY_LOG_LEVEL=info",
 		e.ImageName(),
 	)
+}
+
+// noteImageDrift says when an existing cache runs another image than the one
+// configured: `up` never recreates a running cache, so a new default image (or
+// --image) only takes effect after `down` + `up`, which keeps the volume.
+func (e *Engine) noteImageDrift(ctx context.Context, u Upstream) {
+	img, err := e.containerImage(ctx, container(u))
+	if err != nil || img == "" || img == e.ImageName() {
+		return
+	}
+	e.logf("    %-9s runs %s, configured %s — `regcachectl down && regcachectl up` switches it (cached data is kept)",
+		"", img, e.ImageName())
+}
+
+// containerImage is the image a container was created from.
+func (e *Engine) containerImage(ctx context.Context, name string) (string, error) {
+	return e.run(ctx, "inspect", "--format", "{{.Config.Image}}", name)
 }
 
 // imageExists reports whether the runtime has the named image locally.
@@ -362,8 +415,25 @@ func (e *Engine) Status(ctx context.Context) ([]Status, error) {
 	return out, nil
 }
 
-// GC runs registry garbage-collect inside every running cache.
-func (e *Engine) GC(ctx context.Context) error {
+// GC runs registry garbage-collect against every running registry cache.
+//
+// It never deletes a manifest the cache holds by default. `--delete-untagged`
+// would: a pull-through cache records a tag only when a client pulls by tag,
+// so everything pulled by digest — an OKD release payload, a digest-pinned
+// helm chart image — is "untagged" and is swept with its layers. registry:2.8
+// additionally aborts the whole run ("failed to retrieve tags unknown
+// repository") on a repository that holds no tag at all. deleteUntagged opts
+// into it anyway, for reclaiming space when losing digest pins is acceptable.
+//
+// Each cache is stopped for the run and started again afterwards, even when
+// the run fails or is interrupted. garbage-collect against a serving registry
+// is unsafe: distribution's docs require it "in read-only mode or not running
+// at all", since layers written during the run can be deleted — and in a proxy
+// every cache miss is a write. The serving process also keeps a stale
+// in-memory descriptor of every blob it deletes and answers 200 with the full
+// Content-Length and an empty body (a client's "unexpected EOF") until it
+// restarts.
+func (e *Engine) GC(ctx context.Context, deleteUntagged bool) error {
 	for _, u := range Upstreams {
 		_, running, err := e.containerState(ctx, container(u))
 		if err != nil {
@@ -378,19 +448,61 @@ func (e *Engine) GC(ctx context.Context) error {
 			e.logf("  · %-9s blobcache (digest-keyed; no gc)", u.Name)
 			continue
 		}
-		out, err := e.run(ctx, "exec", container(u),
-			"registry", "garbage-collect", "/etc/docker/registry/config.yml", "--delete-untagged")
-		if err != nil {
-			// An empty cache has no repositories dir yet — not an error.
-			if strings.Contains(err.Error(), "Path not found") || strings.Contains(err.Error(), "repositories") {
-				e.logf("  · %-9s empty", u.Name)
-				continue
-			}
+		if err := e.gcOne(ctx, u, deleteUntagged); err != nil {
 			return fmt.Errorf("gc %s: %w", u.Name, err)
 		}
-		e.logf("  ♻ %-9s %s", u.Name, lastLine(out))
 	}
 	return nil
+}
+
+// gcScript runs garbage-collect with whichever config the image ships:
+// distribution v3 moved it from /etc/docker/registry to /etc/distribution.
+const gcScript = `cfg=/etc/distribution/config.yml; [ -f "$cfg" ] || cfg=/etc/docker/registry/config.yml; exec registry garbage-collect "$cfg" "$@"`
+
+func (e *Engine) gcOne(ctx context.Context, u Upstream, deleteUntagged bool) (err error) {
+	img, err := e.containerImage(ctx, container(u))
+	if err != nil {
+		return err
+	}
+	if _, err := e.run(ctx, "stop", container(u)); err != nil {
+		return err
+	}
+	defer func() {
+		// not ctx: an interrupted gc must not leave the cache stopped (a
+		// stopped container is not revived by --restart=always).
+		if _, serr := e.run(context.Background(), "start", container(u)); serr != nil && err == nil {
+			err = serr
+		}
+	}()
+	args := []string{"run", "--rm", "-v", volume(u) + ":/var/lib/registry",
+		"--entrypoint", "sh", img, "-c", gcScript, "gc"}
+	if deleteUntagged {
+		args = append(args, "--delete-untagged")
+	}
+	out, err := e.run(ctx, args...)
+	if err != nil {
+		// An empty cache has no repositories dir yet — not an error.
+		if strings.Contains(err.Error(), "Path not found") {
+			e.logf("  · %-9s empty", u.Name)
+			return nil
+		}
+		return err
+	}
+	e.logf("  ♻ %-9s %s", u.Name, gcSummary(out))
+	return nil
+}
+
+var gcCounts = regexp.MustCompile(`(\d+) blobs marked, (\d+) blobs and (\d+) manifests eligible for deletion`)
+
+// gcSummary is garbage-collect's closing count line, or its last line.
+func gcSummary(out string) string {
+	if m := gcCounts.FindStringSubmatch(out); m != nil {
+		marked, _ := strconv.Atoi(m[1])
+		blobs, _ := strconv.Atoi(m[2])
+		manifests, _ := strconv.Atoi(m[3])
+		return fmt.Sprintf("%d blobs kept, %d blobs and %d manifests deleted", marked, blobs, manifests)
+	}
+	return lastLine(out)
 }
 
 func (e *Engine) ensureVolume(ctx context.Context, name string) error {

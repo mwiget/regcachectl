@@ -10,8 +10,9 @@
 //
 //	regcachectl up [--far-key keys/f5-far-auth-key.tgz]
 //	regcachectl status
-//	regcachectl print-registries [--host host.docker.internal] [--no-fallback]
-//	regcachectl gc
+//	regcachectl print-registries [--format k3s|crio|okd] [--host host.docker.internal] [--no-fallback]
+//	regcachectl pull-release <release-ref> [--platform linux/amd64] [-j 4]
+//	regcachectl gc [--delete-untagged]
 //	regcachectl down [--purge]
 //	regcachectl install-systemd [--far-key …] [--write]
 package main
@@ -81,11 +82,17 @@ func run(ctx context.Context, argv []string) error {
 	case "up":
 		fs := flag.NewFlagSet("up", flag.ExitOnError)
 		f := addRuntimeFlags(fs)
+		ttl := fs.Duration("proxy-ttl", cache.DefaultProxyTTL,
+			"how long a registry cache keeps fetched content, e.g. 720h (0 = until gc/purge; applies to newly created caches, registry v3 only)")
 		_ = fs.Parse(rest)
+		if *ttl < 0 {
+			return fmt.Errorf("up: --proxy-ttl must not be negative")
+		}
 		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase, portBaseSet(f.fs))
 		if err != nil {
 			return err
 		}
+		e.ProxyTTL = *ttl
 		fmt.Println("Bringing up pull-through cache fleet (" + e.Runtime + ", holds no credentials):")
 		return e.Up(ctx)
 
@@ -116,10 +123,15 @@ func run(ctx context.Context, argv []string) error {
 		f := addRuntimeFlags(fs)
 		objects := fs.Bool("objects", false, "list cached images (repo:tag, or repo name for F5 blobs), not just totals")
 		blobs := fs.Bool("blobs", false, "for the F5 blob cache, list individual layer digests + sizes instead of image names")
+		release := fs.String("okd-release", "", "report how many payload images of this OKD/OpenShift release image are cached (read-only)")
+		platform := fs.String("platform", cache.DefaultReleasePlatform, "with --okd-release: the platform to check (empty = all)")
 		_ = fs.Parse(rest)
 		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase, portBaseSet(f.fs))
 		if err != nil {
 			return err
+		}
+		if *release != "" {
+			return printCoverage(ctx, e, *release, *platform, *objects)
 		}
 		return printList(ctx, e, *objects || *blobs, *blobs)
 
@@ -138,16 +150,37 @@ func run(ctx context.Context, argv []string) error {
 		}
 		return e.Pull(ctx, refs, *creds)
 
+	case "pull-release":
+		fs := flag.NewFlagSet("pull-release", flag.ExitOnError)
+		f := addRuntimeFlags(fs)
+		platform := fs.String("platform", cache.DefaultReleasePlatform, "platform of multi-arch payload images to warm (empty = all)")
+		jobs := fs.Int("j", 4, "payload images warmed concurrently")
+		creds := fs.String("creds", "", "upstream creds user:password for the token endpoint")
+		_ = fs.Parse(rest)
+		if fs.NArg() != 1 {
+			return fmt.Errorf("pull-release: exactly one release image required (e.g. regcachectl pull-release quay.io/okd/scos-release:4.22.0-okd-scos.10)")
+		}
+		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase, portBaseSet(f.fs))
+		if err != nil {
+			return err
+		}
+		return e.PullRelease(ctx, fs.Arg(0), *platform, *jobs, *creds)
+
 	case "gc":
 		fs := flag.NewFlagSet("gc", flag.ExitOnError)
 		f := addRuntimeFlags(fs)
+		untagged := fs.Bool("delete-untagged", false,
+			"also delete manifests no tag points at — which in a pull-through cache is EVERYTHING pulled by digest (OKD payloads, digest pins)")
 		_ = fs.Parse(rest)
 		e, err := buildEngine(ctx, *f.runtime, *f.image, *f.portBase, portBaseSet(f.fs))
 		if err != nil {
 			return err
 		}
-		fmt.Println("Garbage-collecting caches:")
-		return e.GC(ctx)
+		fmt.Println("Garbage-collecting caches (each is stopped for the run):")
+		if *untagged {
+			fmt.Println("  ! --delete-untagged: digest-pulled images are deleted too")
+		}
+		return e.GC(ctx, *untagged)
 
 	case "export":
 		fs := flag.NewFlagSet("export", flag.ExitOnError)
@@ -188,7 +221,9 @@ func run(ctx context.Context, argv []string) error {
 		fs := flag.NewFlagSet("print-registries", flag.ExitOnError)
 		host := fs.String("host", cache.DefaultHost, "address k3s nodes use to reach the host")
 		portBase := fs.Int("port-base", cache.DefaultPortBase, "host port of the first cache")
-		noFallback := fs.Bool("no-fallback", false, "omit the direct-upstream fallback endpoint")
+		noFallback := fs.Bool("no-fallback", false, "omit the direct-upstream fallback endpoint (okd: NeverContactSource)")
+		format := fs.String("format", cache.FormatK3s, "output format: "+strings.Join(cache.Formats, "|")+
+			" (k3s registries.yaml, containers registries.conf, OKD mirror-set manifests)")
 		_ = fs.Parse(rest)
 		// Emitting mirror endpoints for the wrong ports is the costliest way
 		// to get the port base wrong — the cluster looks correctly wired and
@@ -199,7 +234,11 @@ func run(ctx context.Context, argv []string) error {
 		if err != nil {
 			e = &cache.Engine{PortBase: *portBase, PortBaseSet: portBaseSet(fs)}
 		}
-		fmt.Print(e.RenderRegistries(*host, !*noFallback))
+		out, err := e.Render(*format, *host, !*noFallback)
+		if err != nil {
+			return err
+		}
+		fmt.Print(out)
 		return nil
 
 	case "serve-blobcache":
@@ -276,6 +315,27 @@ func printStatus(ctx context.Context, e *cache.Engine) error {
 		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%s\n", s.Name, s.Host, s.Port, s.State, disk, reach)
 	}
 	return tw.Flush()
+}
+
+func printCoverage(ctx context.Context, e *cache.Engine, release, platform string, missing bool) error {
+	c, err := e.ReleaseCoverage(ctx, release, platform)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s: %d/%d payload images cached in %s", release, c.Full, c.Total-c.Elsewhere, c.Cache)
+	if c.ManifestOnly > 0 {
+		fmt.Printf(" (%d more with a layer missing)", c.ManifestOnly)
+	}
+	if c.Elsewhere > 0 {
+		fmt.Printf(", %d on other registries not checked", c.Elsewhere)
+	}
+	fmt.Println()
+	if missing {
+		for _, m := range c.Missing {
+			fmt.Println("    missing", m)
+		}
+	}
+	return nil
 }
 
 func printList(ctx context.Context, e *cache.Engine, objects, blobs bool) error {
@@ -356,10 +416,17 @@ COMMANDS:
   pull <ref>…        warm a cache with EVERY platform of an image (multi-arch),
                      so export/import carries all arches (nvcr.io: needs an NGC
                      key in ~/.ngc or --creds '$oauthtoken:<key>')
+  pull-release <ref> warm the caches with an OKD/OpenShift release and every
+                     payload image it lists (--platform linux/amd64, -j 4);
+                     list --okd-release <ref> reports how much is cached
   export [-o f.tgz]  bundle every cache's data into one .tgz to copy elsewhere
   import <f.tgz>     unpack a bundle into this host's cache volumes (seeds offline)
-  gc                 run registry garbage-collect in each public cache
-  print-registries   emit the k3s registries.yaml snippet to wire nodes
+  gc                 run registry garbage-collect in each public cache (stops each
+                     for the run; keeps digest-pulled images unless
+                     --delete-untagged)
+  print-registries   emit the mirror config to wire nodes: --format k3s
+                     (registries.yaml, default) | crio (registries.conf) |
+                     okd (ImageDigestMirrorSet/ImageTagMirrorSet/Image)
   serve-blobcache    (internal) run the credential-free blob cache; used by the
                      repo.f5.com container, not run by hand
   install-systemd    print/write a systemd unit so the fleet survives reboot

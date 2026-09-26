@@ -40,11 +40,9 @@ func (e *Engine) Export(ctx context.Context, outPath string, only []string) erro
 		}
 		return errors.New("no cache volumes to export — run `up` and pull some images first")
 	}
-	helper := e.ImageName()
-	if ok, err := e.imageExists(ctx, helper); err != nil {
+	helper, err := e.helperImage(ctx)
+	if err != nil {
 		return err
-	} else if !ok {
-		return fmt.Errorf("helper image %s not present — run `regcachectl up` first", helper)
 	}
 
 	f, err := os.Create(outPath)
@@ -79,12 +77,9 @@ func (e *Engine) Import(ctx context.Context, inPath string) error {
 	}
 	defer f.Close()
 
-	helper := e.ImageName()
-	if ok, _ := e.imageExists(ctx, helper); !ok {
-		e.logf("helper image %s absent — pulling ...", helper)
-		if _, err := e.run(ctx, "pull", helper); err != nil {
-			return fmt.Errorf("helper image %s not present and pull failed (%w) — run `regcachectl up` first", helper, err)
-		}
+	helper, err := e.helperImage(ctx)
+	if err != nil {
+		return err
 	}
 
 	var mounts []string
@@ -102,6 +97,20 @@ func (e *Engine) Import(ctx context.Context, inPath string) error {
 	}
 	e.logf("imported. run `regcachectl up` to (re)start the fleet serving the data.")
 	return nil
+}
+
+// helperImage is the image export/import run tar in: the configured registry
+// image (Alpine, so it has tar), pulled if absent — a fleet created under an
+// older default image does not have the current one yet.
+func (e *Engine) helperImage(ctx context.Context) (string, error) {
+	helper := e.ImageName()
+	if ok, _ := e.imageExists(ctx, helper); !ok {
+		e.logf("helper image %s absent — pulling ...", helper)
+		if _, err := e.run(ctx, "pull", helper); err != nil {
+			return "", fmt.Errorf("helper image %s not present and pull failed (%w) — run `regcachectl up` first", helper, err)
+		}
+	}
+	return helper, nil
 }
 
 // runStream runs the runtime CLI wiring stdin/stdout to the given streams (so a
