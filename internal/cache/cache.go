@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os/exec"
 	"regexp"
 	"strconv"
@@ -109,6 +110,10 @@ type Engine struct {
 	// ports maps an upstream name to the host port its container publishes,
 	// filled by DiscoverPorts. Empty until then (and for absent caches).
 	ports map[string]int
+
+	// transport, when set, carries the registry HTTP requests of pull and
+	// pull-release (tests observe how bodies are consumed through it).
+	transport http.RoundTripper
 
 	// ProxyTTL is the registry proxy's content expiry (proxy.ttl); 0 never
 	// expires. Only distribution v3 honours it — registry:2.8 ignores the

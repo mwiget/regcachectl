@@ -115,7 +115,7 @@ func (e *Engine) pullOne(ctx context.Context, raw, creds string) error {
 		}
 	}
 
-	pc := &pullClient{hc: &http.Client{}, base: fmt.Sprintf("http://localhost:%d", port), repo: rf.repo, creds: creds}
+	pc := &pullClient{hc: &http.Client{Transport: e.transport}, base: fmt.Sprintf("http://localhost:%d", port), repo: rf.repo, creds: creds}
 
 	e.logf("warming %s/%s:%s (all platforms) via :%d ...", rf.host, rf.repo, rf.ref, port)
 	st, err := pc.warmImage(ctx, rf.ref, "", func(plat, digest string, n int) {

@@ -107,7 +107,7 @@ func countSeen(m *sync.Map) int {
 
 func (e *Engine) pullClient(idx int, repo, creds string, seen *sync.Map) *pullClient {
 	return &pullClient{
-		hc:    &http.Client{},
+		hc:    &http.Client{Transport: e.transport},
 		base:  fmt.Sprintf("http://localhost:%d", e.Port(idx)),
 		repo:  repo,
 		creds: creds,

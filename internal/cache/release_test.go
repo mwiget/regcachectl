@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -33,7 +34,7 @@ type fakeRegistry struct {
 	gets      map[string]int
 	inflight  int32
 	maxFlight int32
-	truncated []string // blobs whose body was not read to the end
+	truncated []string // blobs a client closed before reading to the end
 }
 
 type fakeManifest struct {
@@ -136,9 +137,6 @@ func (f *fakeRegistry) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				end = len(b)
 			}
 			if _, err := w.Write(b[off:end]); err != nil {
-				f.mu.Lock()
-				f.truncated = append(f.truncated, d)
-				f.mu.Unlock()
 				return
 			}
 			w.(http.Flusher).Flush()
@@ -156,7 +154,45 @@ func serveAsQuay(t *testing.T, f *fakeRegistry) *Engine {
 	_, portStr, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
 	port, _ := strconv.Atoi(portStr)
 	idx, _ := upstreamIndexForHost("quay.io")
-	return &Engine{PortBase: port - idx, Out: io.Discard}
+	return &Engine{PortBase: port - idx, Out: io.Discard, transport: &eofTracker{f: f}}
+}
+
+// eofTracker records, client side, each blob body closed before its end was
+// read. (Server-side write errors miss it: loopback socket buffers can hold a
+// whole test blob the client never reads.)
+type eofTracker struct{ f *fakeRegistry }
+
+func (tr *eofTracker) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := http.DefaultTransport.RoundTrip(req)
+	if err != nil || !strings.Contains(req.URL.Path, "/blobs/") {
+		return resp, err
+	}
+	resp.Body = &eofBody{ReadCloser: resp.Body, f: tr.f, digest: req.URL.Path[strings.LastIndex(req.URL.Path, "/")+1:]}
+	return resp, nil
+}
+
+type eofBody struct {
+	io.ReadCloser
+	f      *fakeRegistry
+	digest string
+	eof    bool
+}
+
+func (b *eofBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err == io.EOF {
+		b.eof = true
+	}
+	return n, err
+}
+
+func (b *eofBody) Close() error {
+	if !b.eof {
+		b.f.mu.Lock()
+		b.f.truncated = append(b.f.truncated, b.digest)
+		b.f.mu.Unlock()
+	}
+	return b.ReadCloser.Close()
 }
 
 func tarGz(t *testing.T, files map[string][]byte) []byte {
@@ -164,7 +200,13 @@ func tarGz(t *testing.T, files map[string][]byte) []byte {
 	var buf bytes.Buffer
 	zw := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(zw)
-	for name, content := range files {
+	names := make([]string, 0, len(files))
+	for name := range files {
+		names = append(names, name)
+	}
+	sort.Strings(names) // deterministic order: tests put the file they look for first
+	for _, name := range names {
+		content := files[name]
 		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(content)), Typeflag: tar.TypeReg}); err != nil {
 			t.Fatal(err)
 		}
