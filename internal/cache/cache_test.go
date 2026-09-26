@@ -26,12 +26,19 @@ ps)
     *regcache-dockerhub*|*regcache-f5*) echo running ;;
   esac ;;
 inspect) echo registry:2.8.3 ;;
+exec)
+  case "$*" in
+    *" find "*) [ -n "$FAKE_FIND" ] && cat "$FAKE_FIND" ;;
+    *"/okd/content/_layers/sha256") [ -n "$FAKE_LAYERS" ] && cat "$FAKE_LAYERS" ;;
+    *"/okd/content/_manifests/revisions/sha256") [ -n "$FAKE_REVS" ] && cat "$FAKE_REVS" ;;
+  esac ;;
 images) [ -z "$FAKE_NO_IMAGE" ] && echo deadbeef ;;
 volume) shift; case "$1" in ls) echo "$4" | sed 's/^name=^//; s/\$$//' ;; esac ;;
 run)
   case "$*" in
     *garbage-collect*)
       if [ -n "$FAKE_GC_FAIL" ]; then echo "failed to garbage collect" >&2; exit 1; fi
+      [ -n "$FAKE_GC_SLEEP" ] && sleep "$FAKE_GC_SLEEP"
       echo "25 blobs marked, 3 blobs and 1 manifests eligible for deletion" ;;
   esac ;;
 esac
@@ -205,5 +212,19 @@ func TestExport_PullsAMissingHelperImage(t *testing.T) {
 	run := callIndex(log(), "run --rm -v tmm-regcache-quay:/caches/quay:ro "+RegistryImage+" tar czf")
 	if pull < 0 || run < pull {
 		t.Errorf("export did not pull the helper before using it:\n%s", strings.Join(log(), "\n"))
+	}
+}
+
+// Ctrl-C during the collection must still start the cache again.
+func TestGC_InterruptedStillStartsTheCache(t *testing.T) {
+	e, log, _ := fakeRuntime(t)
+	t.Setenv("FAKE_GC_SLEEP", "2")
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(300*time.Millisecond, cancel)
+	if err := e.GC(ctx, false); err == nil {
+		t.Fatal("interrupted gc reported success")
+	}
+	if callIndex(log(), "start regcache-dockerhub") < 0 {
+		t.Errorf("interrupted gc left the cache stopped:\n%s", strings.Join(log(), "\n"))
 	}
 }

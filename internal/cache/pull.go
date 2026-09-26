@@ -250,10 +250,17 @@ type pullClient struct {
 	repo  string
 	creds string // "user:password" or ""
 	token string // cached bearer, minted on the first 401
-	// seen, when set, is shared between clients warming many images of one
-	// cache: a blob is fetched by the first to reach it and skipped by the
-	// rest, so concurrent warmers never pull the same cold blob at once.
+	// seen, when set, is shared between clients warming many images: a blob
+	// is fetched by the first to reach it and skipped by the rest, so
+	// concurrent warmers never pull the same cold blob at once.
 	seen *sync.Map
+}
+
+// seenKey scopes a blob to its cache and repository: a registry serves a blob
+// locally only through a repository that links it, so the same digest in
+// another repository (or cache) still has to be fetched there.
+func (pc *pullClient) seenKey(digest string) string {
+	return pc.base + "/" + pc.repo + "@" + digest
 }
 
 // getManifest GETs repo/manifests/<ref>, doing the bearer token dance on a 401.
@@ -303,13 +310,13 @@ func (pc *pullClient) warmManifestBlobs(ctx context.Context, manifest []byte) (i
 	}
 	for _, d := range digs {
 		if pc.seen != nil {
-			if _, dup := pc.seen.LoadOrStore(d, true); dup {
+			if _, dup := pc.seen.LoadOrStore(pc.seenKey(d), true); dup {
 				continue
 			}
 		}
 		if err := pc.warmBlob(ctx, d); err != nil {
 			if pc.seen != nil {
-				pc.seen.Delete(d) // let a later reference retry it
+				pc.seen.Delete(pc.seenKey(d)) // let a later reference retry it
 			}
 			return 0, err
 		}

@@ -80,7 +80,7 @@ func (e *Engine) PullRelease(ctx context.Context, ref, platform string, jobs int
 		}
 		blobs += r.stats.blobs
 	}
-	e.logf("done: %d/%d payload images warmed (%d blob references, %d distinct blobs) in %s",
+	e.logf("done: %d/%d payload images warmed (%d blob references, %d blobs fetched) in %s",
 		len(refs)-len(failed), len(refs), blobs, countSeen(seen), time.Since(start).Round(time.Second))
 	if len(failed) > 0 {
 		sort.Strings(failed)
@@ -243,7 +243,7 @@ func (pc *pullClient) fileInBlob(ctx context.Context, digest, path string) ([]by
 		return nil, false, fmt.Errorf("stream blob: %w", err)
 	}
 	if pc.seen != nil {
-		pc.seen.Store(digest, true)
+		pc.seen.Store(pc.seenKey(digest), true)
 	}
 	return content, found, nil
 }

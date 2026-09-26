@@ -25,7 +25,7 @@ type ReleaseCoverage struct {
 // confirmed is on disk, so the proxy answers locally and never goes upstream.
 type storeView interface {
 	hasManifest(repo, digest string) bool
-	hasBlob(digest string) bool
+	hasBlob(repo, digest string) bool // stored, and linked into repo
 	tagDigest(repo, tag string) (string, bool)
 	readManifest(repo, digest string) (body []byte, contentType string, err error)
 	openBlob(repo, digest string) (io.ReadCloser, error)
@@ -49,7 +49,7 @@ func (e *Engine) ReleaseCoverage(ctx context.Context, ref, platform string) (Rel
 	} else if !running {
 		return ReleaseCoverage{}, fmt.Errorf("cache %s is not running", u.Name)
 	}
-	v := &diskView{e: e, ctx: ctx, u: u, port: e.Port(idx), revs: map[string]map[string]bool{}}
+	v := &diskView{e: e, ctx: ctx, u: u, port: e.Port(idx), revs: map[string]map[string]bool{}, layers: map[string]map[string]bool{}}
 	if err := v.loadBlobs(); err != nil {
 		return ReleaseCoverage{}, err
 	}
@@ -114,7 +114,7 @@ func imageOnDisk(v storeView, repo, digest, platform string) (full, manifest boo
 		return false, true
 	}
 	if !isIndex(ctype) {
-		return blobsOnDisk(v, body), true
+		return blobsOnDisk(v, repo, body), true
 	}
 	ix, err := parseIndex(body)
 	if err != nil {
@@ -130,14 +130,14 @@ func imageOnDisk(v storeView, repo, digest, platform string) (full, manifest boo
 			return false, true
 		}
 		child, _, err := v.readManifest(repo, m.digest)
-		if err != nil || !blobsOnDisk(v, child) {
+		if err != nil || !blobsOnDisk(v, repo, child) {
 			return false, true
 		}
 	}
 	return matched > 0, true
 }
 
-func blobsOnDisk(v storeView, manifest []byte) bool {
+func blobsOnDisk(v storeView, repo string, manifest []byte) bool {
 	var m struct {
 		Config struct {
 			Digest string `json:"digest"`
@@ -149,11 +149,11 @@ func blobsOnDisk(v storeView, manifest []byte) bool {
 	if json.Unmarshal(manifest, &m) != nil {
 		return false
 	}
-	if m.Config.Digest != "" && !v.hasBlob(m.Config.Digest) {
+	if m.Config.Digest != "" && !v.hasBlob(repo, m.Config.Digest) {
 		return false
 	}
 	for _, l := range m.Layers {
-		if !v.hasBlob(l.Digest) {
+		if !v.hasBlob(repo, l.Digest) {
 			return false
 		}
 	}
@@ -198,7 +198,7 @@ func localFileInLayers(v storeView, repo string, manifest []byte, file string) (
 	}
 	for i := len(m.Layers) - 1; i >= 0; i-- {
 		d := m.Layers[i].Digest
-		if !v.hasBlob(d) {
+		if !v.hasBlob(repo, d) {
 			return nil, fmt.Errorf("layer %s is not cached", ShortDigest(d))
 		}
 		body, err := v.openBlob(repo, d)
@@ -220,12 +220,13 @@ func localFileInLayers(v storeView, repo string, manifest []byte, file string) (
 // diskView is storeView over a running registry cache: the on-disk store read
 // by exec in the container, content fetched over its HTTP port.
 type diskView struct {
-	e     *Engine
-	ctx   context.Context
-	u     Upstream
-	port  int
-	blobs map[string]bool
-	revs  map[string]map[string]bool // repo → manifest digests with a revision link
+	e      *Engine
+	ctx    context.Context
+	u      Upstream
+	port   int
+	blobs  map[string]bool
+	revs   map[string]map[string]bool // repo → manifest digests with a revision link
+	layers map[string]map[string]bool // repo → blob digests linked into it
 }
 
 const registryRoot = "/var/lib/registry/docker/registry/v2"
@@ -244,19 +245,29 @@ func (v *diskView) loadBlobs() error {
 	return nil
 }
 
-func (v *diskView) hasBlob(digest string) bool { return v.blobs[digest] }
+// hasBlob: the blob's data is stored and repo links it — a registry serves a
+// blob locally only through a repository that links it.
+func (v *diskView) hasBlob(repo, digest string) bool {
+	return v.blobs[digest] && v.links(v.layers, repo, "_layers/sha256")[digest]
+}
 
+// hasManifest: the manifest revision is linked into repo and its data stored.
 func (v *diskView) hasManifest(repo, digest string) bool {
-	revs, ok := v.revs[repo]
-	if !ok {
-		out, _ := v.e.run(v.ctx, "exec", container(v.u), "ls", "-1", registryRoot+"/repositories/"+repo+"/_manifests/revisions/sha256")
-		revs = map[string]bool{}
-		for _, h := range strings.Fields(out) {
-			revs["sha256:"+h] = true
-		}
-		v.revs[repo] = revs
+	return v.blobs[digest] && v.links(v.revs, repo, "_manifests/revisions/sha256")[digest]
+}
+
+// links lists (once per repo) the digests linked under a repository subdir.
+func (v *diskView) links(cache map[string]map[string]bool, repo, sub string) map[string]bool {
+	if l, ok := cache[repo]; ok {
+		return l
 	}
-	return revs[digest] && v.blobs[digest]
+	out, _ := v.e.run(v.ctx, "exec", container(v.u), "ls", "-1", registryRoot+"/repositories/"+repo+"/"+sub)
+	l := map[string]bool{}
+	for _, h := range strings.Fields(out) {
+		l["sha256:"+h] = true
+	}
+	cache[repo] = l
+	return l
 }
 
 func (v *diskView) tagDigest(repo, tag string) (string, bool) {

@@ -421,11 +421,13 @@ func (e *Engine) Status(ctx context.Context) ([]Status, error) {
 // into it anyway, for reclaiming space when losing digest pins is acceptable.
 //
 // Each cache is stopped for the run and started again afterwards, even when
-// the run fails. garbage-collect against a serving registry is unsafe:
-// distribution documents that a blob fetched during the mark phase can be
-// swept, and the serving process keeps a stale in-memory descriptor of every
-// blob it deletes — it then answers 200 with the full Content-Length and an
-// empty body (a client's "unexpected EOF") until it restarts.
+// the run fails or is interrupted. garbage-collect against a serving registry
+// is unsafe: distribution's docs require it "in read-only mode or not running
+// at all", since layers written during the run can be deleted — and in a proxy
+// every cache miss is a write. The serving process also keeps a stale
+// in-memory descriptor of every blob it deletes and answers 200 with the full
+// Content-Length and an empty body (a client's "unexpected EOF") until it
+// restarts.
 func (e *Engine) GC(ctx context.Context, deleteUntagged bool) error {
 	for _, u := range Upstreams {
 		_, running, err := e.containerState(ctx, container(u))
@@ -461,7 +463,9 @@ func (e *Engine) gcOne(ctx context.Context, u Upstream, deleteUntagged bool) (er
 		return err
 	}
 	defer func() {
-		if _, serr := e.run(ctx, "start", container(u)); serr != nil && err == nil {
+		// not ctx: an interrupted gc must not leave the cache stopped (a
+		// stopped container is not revived by --restart=always).
+		if _, serr := e.run(context.Background(), "start", container(u)); serr != nil && err == nil {
 			err = serr
 		}
 	}()

@@ -380,3 +380,23 @@ func TestPlatformMatches(t *testing.T) {
 		}
 	}
 }
+
+// A blob is served locally only through a repository that links it, so a
+// layer shared by images in two repositories is warmed once in each.
+func TestPullRelease_SharedBlobWarmedPerRepository(t *testing.T) {
+	f := newFakeRegistry()
+	base := []byte("shared base layer")
+	a := f.addImage("okd/content", base, []byte("a"))
+	b := f.addImage("okd/other", base, []byte("b"))
+	top := tarGz(t, map[string][]byte{imageReferencesPath: imageStream("quay.io/okd/content@"+a, "quay.io/okd/other@"+b)})
+	rel := f.addImage("okd/release", top)
+	e := serveAsQuay(t, f)
+	if err := e.PullRelease(context.Background(), "quay.io/okd/release@"+rel, "", 2, ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, repo := range []string{"okd/content", "okd/other"} {
+		if n := f.count("/v2/" + repo + "/blobs/" + digestOf(base)); n != 1 {
+			t.Errorf("shared layer fetched %d times through %s, want 1", n, repo)
+		}
+	}
+}

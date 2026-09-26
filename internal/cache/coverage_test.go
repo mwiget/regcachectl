@@ -2,9 +2,11 @@ package cache
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"testing"
 )
@@ -17,11 +19,12 @@ type fakeStore struct {
 	f         *fakeRegistry
 	manifests map[string]bool // "repo@digest"
 	blobs     map[string]bool
+	unlinked  map[string]bool   // "repo@digest": data stored, not linked into repo
 	tags      map[string]string // "repo:tag" → digest
 }
 
 func newFakeStore(t *testing.T, f *fakeRegistry) *fakeStore {
-	s := &fakeStore{t: t, f: f, manifests: map[string]bool{}, blobs: map[string]bool{}, tags: map[string]string{}}
+	s := &fakeStore{t: t, f: f, manifests: map[string]bool{}, blobs: map[string]bool{}, unlinked: map[string]bool{}, tags: map[string]string{}}
 	for k := range f.manifests {
 		s.manifests[k] = true
 	}
@@ -32,7 +35,7 @@ func newFakeStore(t *testing.T, f *fakeRegistry) *fakeStore {
 }
 
 func (s *fakeStore) hasManifest(repo, d string) bool { return s.manifests[repo+"@"+d] }
-func (s *fakeStore) hasBlob(d string) bool           { return s.blobs[d] }
+func (s *fakeStore) hasBlob(repo, d string) bool     { return s.blobs[d] && !s.unlinked[repo+"@"+d] }
 func (s *fakeStore) tagDigest(repo, tag string) (string, bool) {
 	d, ok := s.tags[repo+":"+tag]
 	return d, ok
@@ -46,7 +49,7 @@ func (s *fakeStore) readManifest(repo, d string) ([]byte, string, error) {
 	return m.body, m.ctype, nil
 }
 func (s *fakeStore) openBlob(repo, d string) (io.ReadCloser, error) {
-	if !s.hasBlob(d) {
+	if !s.hasBlob(repo, d) {
 		s.t.Errorf("read blob %s that is not on disk", ShortDigest(d))
 		return nil, fmt.Errorf("not on disk")
 	}
@@ -135,5 +138,63 @@ func jsonUnmarshal(t *testing.T, b []byte, v any) {
 	t.Helper()
 	if err := json.Unmarshal(b, v); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A layer stored for another repository but not linked into this one would be
+// fetched from the upstream again: not cached.
+func TestReleaseCoverage_UnlinkedBlobIsMissing(t *testing.T) {
+	f := newFakeRegistry()
+	r := buildRelease(t, f, 2)
+	s := newFakeStore(t, f)
+	s.unlinked["okd/content@"+r.shared] = true
+	rf, _ := parseRef(r.ref)
+	cov, err := releaseCoverage(s, quayUpstream(), rf, "linux/amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cov.Full != 0 || cov.ManifestOnly != cov.Total {
+		t.Errorf("%+v, want every image manifest-only without its base layer linked", cov)
+	}
+}
+
+// diskView reads the registry's on-disk layout: blob data under blobs/, and
+// per repository the layer and manifest-revision links.
+func TestDiskView(t *testing.T) {
+	e, _, _ := fakeRuntime(t)
+	dir := t.TempDir()
+	h := func(c byte) string { return strings.Repeat(string(c), 64) }
+	write := func(name, content string) string {
+		p := dir + "/" + name
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	root := registryRoot + "/blobs/sha256/"
+	t.Setenv("FAKE_FIND", write("find", root+"aa/"+h('a')+"/data\n"+root+"bb/"+h('b')+"/data\n"+root+"cc/"+h('c')+"/data\n"))
+	t.Setenv("FAKE_LAYERS", write("layers", h('a')+"\n"+h('d')+"\n")) // d linked, no data
+	t.Setenv("FAKE_REVS", write("revs", h('c')+"\n"+h('e')+"\n"))     // e: revision, no data
+
+	v := &diskView{e: e, ctx: context.Background(), u: quayUpstream(), revs: map[string]map[string]bool{}, layers: map[string]map[string]bool{}}
+	if err := v.loadBlobs(); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name string
+		got  bool
+		want bool
+	}{
+		{"linked blob with data", v.hasBlob("okd/content", "sha256:"+h('a')), true},
+		{"blob with data, not linked", v.hasBlob("okd/content", "sha256:"+h('b')), false},
+		{"linked blob without data", v.hasBlob("okd/content", "sha256:"+h('d')), false},
+		{"blob in another repository", v.hasBlob("okd/other", "sha256:"+h('a')), false},
+		{"manifest revision with data", v.hasManifest("okd/content", "sha256:"+h('c')), true},
+		{"blob that is no revision", v.hasManifest("okd/content", "sha256:"+h('a')), false},
+		{"revision without data", v.hasManifest("okd/content", "sha256:"+h('e')), false},
+	} {
+		if c.got != c.want {
+			t.Errorf("%s: %v, want %v", c.name, c.got, c.want)
+		}
 	}
 }
